@@ -1,0 +1,136 @@
+# Publish the AArch64 build of chroot-ng as a release asset.
+#
+# Why: a consumer on Android needs a pinned binary, not the source tree. The
+# source stays here; the artifact is what gets pinned — a tag, a URL and a
+# SHA-256 the consumer can verify before it ships the file inside an APK.
+#
+# The asset is named `libchrootng.so` because of how Android installs native
+# libraries: only `lib/<abi>/lib*.so` is extracted into the app's
+# `nativeLibraryDir`, which is the one directory an app may exec from. The
+# file is not a shared object — it is a static, freestanding AArch64
+# executable with its own loader and linker script. The name is a packaging
+# requirement, not a description of the file.
+#
+# The build runs on the same native AArch64 runner the test suite uses, so the
+# published binary is the one the suite ran against. The test run itself is in
+# the `tests` workflow, on the same commit.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish a GitHub release for the built artifact'
+        type: boolean
+        default: false
+      tag:
+        description: 'Tag to publish under (defaults to the ref name)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# A release must not be cancelled half way by a newer push to the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (native AArch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Toolchain
+        run: |
+          cc --version
+          make --version
+          uname -srm
+
+      # Warnings are defects here (see AGENTS.md), so they fail the build. Set
+      # through the environment, not the make command line: a command-line
+      # CFLAGS would override the Makefile's own `+=` additions as well.
+      - name: Build
+        env:
+          CFLAGS: -O2 -g -Werror
+        run: make -j"$(nproc)"
+
+      # The capability probe on the runner's kernel. Its exit status is 1 when a
+      # hard prerequisite of the in-process design fails, so a build that cannot
+      # work on a device is caught here rather than there.
+      - name: Probe host capabilities
+        run: make probe
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/chroot-ng dist/libchrootng.so
+          (cd dist && sha256sum libchrootng.so > libchrootng.so.sha256)
+          ls -l dist
+          cat dist/libchrootng.so.sha256
+
+      # Uploaded on every run, tag or not, so a consumer can take a build
+      # without waiting for a release to be cut.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libchrootng-aarch64
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: libchrootng-aarch64
+          path: dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          # The hash travels with the file, and the file is what it claims to be.
+          sha256sum -c libchrootng.so.sha256
+          file libchrootng.so || true
+          cat > notes.md <<EOF
+          AArch64 build of chroot-ng, built and probed on \`ubuntu-24.04-arm\`.
+
+          - commit: $GITHUB_SHA
+          - sha256: $(cut -d' ' -f1 libchrootng.so.sha256)
+          - size: $(stat -c %s libchrootng.so) bytes
+
+          The binary is a static, freestanding AArch64 executable: no libc, no
+          PIE, its own loader and linker script. The file name is a packaging
+          requirement — Android's installer only extracts \`lib/<abi>/lib*.so\`
+          into the app's \`nativeLibraryDir\`, the one directory an app may exec
+          from.
+
+          Verify before shipping it:
+
+              sha256sum -c libchrootng.so.sha256
+
+          The test suite for this commit runs in the \`tests\` workflow.
+          EOF
+          gh release create "$TAG" \
+            --title "chroot-ng $TAG" \
+            --notes-file notes.md \
+            libchrootng.so libchrootng.so.sha256
