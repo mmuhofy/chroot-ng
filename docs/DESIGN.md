@@ -133,8 +133,17 @@ answer `stat` and `access` as well as `open`: a refused call on a name we serve
 gets the attributes of a `/proc` regular file). Because
 we run the guest in this process and never `execve`, those files are the kernel's
 record of *our* invocation, so this is a correctness requirement, not polish.
+`cmdline` and `environ` are the exception that can be fixed at the source, as
+comm is with `PR_SET_NAME`: where the kernel accepts `PR_SET_MM_MAP` its record
+is pointed at the guest's strings, and where it does not (Android) the ranges
+the loader recorded are read out of guest memory under the kernel's rules, so a
+title written over argv shows either way (M100).
 See `src/monitor/procfs.c` (synthesis) and `src/monitor/procreg.c` (the
-fork-inherited registry that tells a guest pid from a host one).
+fork-inherited registry that tells a guest pid from a host one). The calls that
+name a process by pid rather than by path follow the same rule: a hidden pid
+is ESRCH to `process_vm_readv`/`writev`, `pidfd_open` (M46) and the signal
+family, and `kill`'s group and broadcast forms reach only the guest processes
+in them (M85).
 
 The walk produces a host path; the syscall is not made on it. A string handed
 to the kernel is resolved again from scratch, following whatever is there by
@@ -201,11 +210,14 @@ rendezvous it serves the `--shared-proc` PID table (as a memfd) and the whole of
 **System V IPC**, which Android leaves us no choice but to emulate: every syscall
 in the family is denied, and there is no writable tmpfs for `/dev/shm`.
 
-Shared memory needs only an owner for the pages: each segment is an anonymous
-memfd the daemon holds and hands to attachers over `SCM_RIGHTS`, and `shmat` maps
-it `MAP_SHARED` — into our own address space, which is also the guest's — then
-closes the fd at once, so a process holds a segment only as a mapping
-(`src/monitor/shm.c`). Semaphore sets and message queues instead live *entirely*
+Shared memory needs only an owner for the pages: each segment is an ashmem
+region (where `/dev/ashmem` opens) or an anonymous memfd the daemon holds and
+hands to attachers over `SCM_RIGHTS`, and `shmat` maps it `MAP_SHARED` — into our
+own address space, which is also the guest's — then closes the fd at once, so a
+process holds a segment only as a mapping (`src/monitor/shm.c`). Host processes
+reach it too, through libandroid-shmem's protocol: a shmid's high half names a
+`"/dev/shm/%08x"` socket the daemon answers on, which is how a Termux X server
+attaches the segment a guest X client hands it in `XShmAttach`. Semaphore sets and message queues instead live *entirely*
 in the daemon (`src/monitor/ipcreg.c`), because they need an arbiter rather than
 a landlord: with every operation an RPC, all mutation is single-threaded, a
 multi-operation `semop` is atomic for free, and a guest that dies mid-call cannot
@@ -213,6 +225,17 @@ leave the registry torn. An operation that must sleep parks its connection there
 and is answered when it can proceed, when its deadline passes, when the object is
 removed, or when the caller cancels it — which is how a blocking `semop` stays
 interruptible even though our SIGSYS handler runs with every other signal masked.
+
+It is also the far end of every **emulated rtnetlink socket**
+(`src/monitor/netlink.c`). The guest's socket is one end of an AF_UNIX
+sequenced-packet pair and the daemon holds the other, polls it, and answers each
+request the moment it arrives — the kernel answers inside the `sendmsg` that
+carries one, and a client may `write(2)` a request and `read(2)` the reply with no
+call in between that the seccomp tier traps, which is what Mozilla's `mtu` crate
+does for Firefox's HTTP/3. A send the monitor does trap waits for the daemon to
+have served it, so its replies are queued when the call returns. The pair's
+hang-up tells the daemon when the guest has closed its socket, since `close(2)` is
+not trapped.
 
 The daemon uses those registries as its own liveness signal and exits once
 nothing is left, leaving no file and no socket name.
@@ -232,7 +255,13 @@ gate `[__cng_gate_start, __cng_gate_end)`. Every raw `svc` from anywhere —
 glibc, musl, Go's runtime, Rust, JIT — traps synchronously, in-process, to the
 `SIGSYS` handler, which reads args from the `ucontext`, translates the path into
 its own buffer, re-issues the real syscall through the gate, and writes the
-result back into the return register. Non-path syscalls run natively.
+result back into the return register. Non-path syscalls run natively. A trapped
+call that can block — a socket call on a blocking descriptor, a FIFO's open,
+a tracee's read — is not made in the handler, which runs with every signal
+masked and would leave it reachable by nothing but `SIGKILL`: the handler
+returns into a stub in the gate that makes the call from the guest's own
+context, the guest's call itself or the whole dispatch, and a second trap puts
+the registers back (`sigsys.c`, the bounce).
 
 **The mmap hook is the choke point** for both `noexec`-defeat and rewriting of
 dynamically-loaded code: when `ld.so` tries to `mmap(PROT_EXEC)` a `.so` from
@@ -282,9 +311,11 @@ Two layers handle this:
   dispatcher. Since our filter only traps syscalls we have explicit handlers
   for, anything reaching the dispatcher's `default` was trapped by *Android* —
   so we emulate `-ENOSYS` directly instead of re-issuing. Credential setters are
-  likewise emulated in place (against the fake-identity credential set under
-  `--fake-id`, else `-ENOSYS`). Nothing is re-issued, so this does not depend on
-  nested signal delivery. (The M8
+  likewise emulated in place: against the fake-identity credential set under
+  `--fake-id`; else, for a setter the probe below found refused, from the real
+  ids and capabilities by the kernel's own rules — 0 for a call that changes
+  nothing, EPERM or EINVAL as the kernel would say (M84). Nothing is re-issued,
+  so this does not depend on nested signal delivery. (The M8
   trampoline path passes `trapped=0`, where an unhandled syscall is an ordinary
   one to run, not a blocked one.)
 - **Block-list probe (for re-issued path syscalls).** Some syscalls we *do*
@@ -318,7 +349,17 @@ disposition: the default action kills, SIG_IGN drops, a handler runs under its
 For a real container you want `-u`/`--fake-id` (fake user identity, default
 `0:0` root), which emulates the credential syscalls against a synthetic
 credential set instead of returning ENOSYS — mirroring proot's `-0`/`-i` and the
-way the reference emulator recommends `--fake-id` for apt/dpkg.
+way the reference emulator recommends `--fake-id` for apt/dpkg. Each process's
+set is its own, inherited across fork, and every guest process still has the
+host's ids in the kernel, which is what it tells a socket peer about. So a
+process also publishes its set in the guest-PID registry, and `SO_PEERCRED` and
+a received `SCM_CREDENTIALS` record name a guest peer by it. After `su - user`,
+a session bus is then told its clients are that user (M102). The groups are
+published with the ids, and `SO_PEERGROUPS`, another process's status file and
+the owner of its `/proc/<pid>` (by which `ps` names its user) come from there
+too (M104). Capabilities are all of them for a fake root and none otherwise,
+and a `capset` is judged against that set by the kernel's rules, so dropping
+them is allowed to anyone (M103).
 
 ### Guest ptrace
 
@@ -345,6 +386,29 @@ mirror the guest's own flags and mask — which is what makes a gdb breakpoint, 
 `brk` poked into read-only text, arrive as a stop rather than kill the guest.
 See `src/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
 
+A running task is reached by a kick signal of ours, and the kick lands wherever
+the thread is — which, for a thread blocked in a call made on its behalf, is
+inside chroot-ng: a bounce stub, an `-R` trampoline, or the dispatcher itself.
+The stop has to show what the kernel shows there, the thread's own registers
+with the call's arguments in place and `pc` at its syscall instruction, and the
+call has to be made again when it ends, with whatever the tracer left in the
+registers. The stubs and the trampolines hold the guest's registers in a
+record, so the kick's frame is put back to the guest's state, as if the call
+were not yet made or already over. The dispatcher's frames cannot be stepped
+out of: its stop reports the guest's registers from the dispatch's own record,
+and a tracer that changes them abandons the call in flight, which is then made
+again as the tracer left it. The kick is `SA_RESTART`, so a call it interrupts
+is restarted rather than failed with `EINTR`.
+
+The kick is an ordinary signal, and a thread can block it, where the kernel's
+attach is a `SIGSTOP` no mask holds back. To a thread whose mask holds the
+kick, the request also goes as a `SIGSYS` of ours, the one signal a guest can
+never block, and is sent again while it is not taken. A standard signal
+absorbs a trap the thread takes while it is pending, so the handler makes a
+call that was skipped that way again. It judges whether the call trapped by
+running the installed filters over it, and whether a handler of ours already
+answered it by the frame that handler returned to.
+
 ### Known hazards (why the tiers exist)
 
 - `execve` erases the in-process handler → emulate `execve` via the loader.
@@ -360,6 +424,14 @@ See `src/monitor/ptrace.c`, `ptsig.c` and `ptstep.c`.
   mask and `SIGSYS` is taken out of it; on the `SIGSYS` tier such a wait is run
   from the guest's own context through a stub in the gate, since the handler,
   which runs with every other signal blocked, cannot run it itself.
+- A call that blocks inside that handler cannot be interrupted at all: a
+  server in `accept` outlived `SIGTERM`, `^C` did not reach a FIFO's `open`, a
+  guest handler ran only after the call returned, and a ptrace attach, whose
+  kick is masked with the rest, hung its tracer → every trapped call that can
+  block is bounced into guest context the same way, where the kernel's own
+  rules interrupt and restart it. Under `-R` the first trap from a site is sent
+  back to the site once the rewrite has made it a branch, so it too runs
+  through the trampoline.
 - The guest (notably Go) can clobber the `SIGSYS` handler or block the signal →
   virtualize `rt_sigaction`/`rt_sigprocmask`/`seccomp`/`prctl`. A guest filter is
   layered on top of ours by the kernel and governs the syscalls the handler

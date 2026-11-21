@@ -257,6 +257,11 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         if (!strncmp(*e, "CNG_PROC_DENY_STAT=", 19) && (*e)[19] != '\0' &&
             (*e)[19] != '0')
             cng_g_proc_deny_stat = 1;
+        /* CNG_PROCFS_REOPEN_DENY=1 takes the memfd reopen that makes a
+         * synthesized view read-only as refused, as Android's policy does. */
+        if (!strncmp(*e, "CNG_PROCFS_REOPEN_DENY=", 23) && (*e)[23] != '\0' &&
+            (*e)[23] != '0')
+            cng_g_procfs_reopen_deny = 1;
         /* CNG_TERMIOS2_DENY=1 refuses the termios2 ioctls with EACCES before
          * the host is asked, as Android's SELinux policy does. */
         if (!strncmp(*e, "CNG_TERMIOS2_DENY=", 18) && (*e)[18] != '\0' &&
@@ -266,6 +271,25 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
         if (!strncmp(*e, "CNG_TIOCGSID_DENY=", 18) && (*e)[18] != '\0' &&
             (*e)[18] != '0')
             cng_g_tiocgsid_deny = 1;
+        /* CNG_TCSETSF_DENY=1 does the same for TCSETSF. */
+        if (!strncmp(*e, "CNG_TCSETSF_DENY=", 17) && (*e)[17] != '\0' &&
+            (*e)[17] != '0')
+            cng_g_tcsetsf_deny = 1;
+        /* CNG_SETID_DENY=1 takes the uid and gid setters as refused by an
+         * ambient filter, as Android's refuses them (cred.c). */
+        if (!strncmp(*e, "CNG_SETID_DENY=", 15) && (*e)[15] != '\0' &&
+            (*e)[15] != '0')
+            cng_g_setid_deny = 1;
+        /* CNG_OPENAT2_DENY=1 does the same for openat2, which a guest then
+         * gets emulated. */
+        if (!strncmp(*e, "CNG_OPENAT2_DENY=", 17) && (*e)[17] != '\0' &&
+            (*e)[17] != '0')
+            cng_g_openat2_deny = 1;
+        /* CNG_MM_MAP_DENY=1 takes PR_SET_MM_MAP as refused, as Android's
+         * kernels refuse it, so cmdline/environ come from guest memory. */
+        if (!strncmp(*e, "CNG_MM_MAP_DENY=", 16) && (*e)[16] != '\0' &&
+            (*e)[16] != '0')
+            cng_g_mm_map_deny = 1;
     }
     /* Stamp the build: this tree is copied to test devices by hand, so a trace
      * has to be able to say whether it came from the build you just made. */
@@ -543,6 +567,26 @@ int cng_run(const char *rootfs, const char *libprefix, const char *workdir,
                         " from an exec-permitted mount, and any code no object"
                         " carries, reaches the host untranslated)\n",
                         -mrc);
+
+        /* A host with no /dev/shm whose temp directories all failed the
+         * stand-in's checks (cng_dev_shm_init) leaves the guest without one,
+         * which it can run without — but its shm_open and sem_open then fail
+         * ENOENT, nowhere near the cause, which is the launcher's: an Android
+         * app that hands over its 0771 files directory as $TMPDIR, say. So
+         * this says which candidates were passed over and why. Only here,
+         * with the monitor in: without it the guest has the host's /dev,
+         * which is what it would have had anyway. */
+        const char *shm_why = cng_dev_shm_missing();
+        if (shm_why)
+            cng_dprintf(2,
+                        "chroot-ng: warning: no temp directory can stand in for"
+                        " the /dev/shm this host lacks, so the guest has none"
+                        " (shm_open and sem_open fail)\n"
+                        "           %s%s\n"
+                        "           (point $TMPDIR at a directory nobody else"
+                        " can write: mode 0700, or sticky like 1777)\n",
+                        *shm_why ? "passed over: " : "no candidate is set",
+                        shm_why);
     }
 
     cng_enter(sp, entry);

@@ -64,7 +64,8 @@ Common options: `-u/--fake-id[=ID]` (fake user identity — `ID` is a `uid` or
 SRC — a directory or a single file, as `mount --bind` takes either — at guest
 path DST, read-only with `:ro`), `-E/--env VAR=VAL` (set a guest environment
 variable — see below), `-w/--work-dir DIR` (start the guest in
-DIR — see below), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`),
+DIR — see below), `-l/--link2symlink` (emulate hardlinks where the host refuses `link(2)`;
+it also reads and keeps the hardlinks of a rootfs installed by `proot-distro`),
 `-R/--rewrite` (ahead-of-time `svc` rewriting), `--no-proc` (turn off the `/proc`
 emulation described below), `--no-dev` (turn off the `/dev` passthrough),
 `--share-abstract-sockets` (don't isolate abstract AF_UNIX names per rootfs), `--shared-proc` (share the process view between
@@ -76,7 +77,10 @@ emulating it).
 than chroot-ng: host processes are hidden from it (by path and from listings,
 including under an explicit `-b /proc:/proc`), `cmdline`/`environ`/`auxv`
 report the guest program (no real `execve` ever happens, so the kernel's copies
-would name the chroot-ng invocation), `mounts`/`mountinfo` describe the rootfs
+would name the chroot-ng invocation; `cmdline` and `environ` are the live
+strings, so a title written over argv shows, and where the kernel accepts
+`PR_SET_MM_MAP` its own record is pointed at them, which host-side `ps` sees
+too), `mounts`/`mountinfo` describe the rootfs
 and its binds instead of the host's mount namespace, `maps` and the `fd` links
 are mapped back to guest paths, and `loadavg`/`uptime`/`stat` (and the
 `sys/kernel/overflow{u,g}id` sysctls, which bubblewrap insists on reading) are
@@ -132,7 +136,10 @@ namespace.
 domains — and everything that asks the kernel about interfaces goes through it:
 `getifaddrs(3)`, iproute2, bubblewrap's `loopback_setup()`, glibc's
 source-address selection. The guest's `socket(AF_NETLINK, …, NETLINK_ROUTE)` is
-served by a stand-in fd whose dumps are relayed through an **unbound** host
+served by a stand-in fd whose far end the per-namespace broker daemon holds (the
+one System V IPC uses, below), answering each request as it arrives however it was
+sent — `write(2)` and `read(2)` included, which is how Firefox asks for the path
+MTU of its HTTP/3 connections. Dumps are relayed through an **unbound** host
 netlink socket, which works because the denial is on `bind(2)`, not on the query.
 Where even the socket is refused, dumps degrade to an empty result so
 `getifaddrs` succeeds with no interfaces rather than failing outright. Nothing
@@ -155,18 +162,21 @@ alone; `CNG_NETLINK_DENY_AUDIT=1` forces the refusal for testing.
 **System V IPC** works too — shared memory, semaphores and message queues.
 Android denies the whole family outright, so chroot-ng serves it itself from a
 per-namespace broker daemon, with no host SysV IPC and no `/dev/shm` anywhere in
-the path. A shared-memory segment is an anonymous `memfd` (or a private file
-where `memfd_create` is unavailable) that the daemon owns and hands to attachers
-over `SCM_RIGHTS`; semaphore sets and message queues live entirely in the daemon,
-so a multi-operation `semop` is atomic and a guest that dies mid-call cannot
-corrupt anything. Blocking operations really block: a `semop`, `msgsnd` or
+the path. A shared-memory segment is an ashmem region where `/dev/ashmem` opens,
+else an anonymous `memfd` (or a private file where `memfd_create` is
+unavailable), that the daemon owns and hands to attachers over `SCM_RIGHTS`. Its
+ids are libandroid-shmem's, so a Termux X server (termux-x11, Xvfb, Xvnc) can
+attach what a guest's MIT-SHM client hands it: `mpv --vo=x11`, GTK and cairo
+get XShm instead of `BadAccess`. Semaphore sets and message queues live entirely
+in the daemon, so a multi-operation `semop` is atomic and a guest that dies
+mid-call cannot corrupt anything. Blocking operations really block: a `semop`, `msgsnd` or
 `msgrcv` that must sleep parks in the daemon and is answered when it can proceed,
 when its `semtimedop` deadline passes, when the object is removed (`EIDRM`), or
 when a signal the guest would take delivery of arrives (`EINTR`). `SEM_UNDO` is
 honored even for a `SIGKILL`ed process. Objects are shared by every process of one
 invocation and isolated between invocations, unless `--shared-proc` widens the
-namespace to the rootfs — and in no configuration do they reach the host's, where
-`ipcs` never sees them.
+namespace to the rootfs — and in no configuration do they reach the host
+kernel's, where `ipcs` never sees them.
 
 POSIX message queues (`mq_open` and friends) are the one IPC namespace with no
 emulation behind it: an mq name is not a filesystem path, so nothing can scope it

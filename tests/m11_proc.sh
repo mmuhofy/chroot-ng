@@ -83,6 +83,11 @@ check_contains "another guest process is described from the registry" \
     "proctest other-pid: -> OK" "$out"
 check_contains "a child's exec outranks the fork publish; a dead pid stops answering" \
     "proctest fork-guard+stale-pid: -> OK" "$out"
+# A child the scheduler runs ahead of its parent's publish registers itself, so
+# a process it forks in that gap is published too, rather than invisible for
+# good — refused by PTRACE_ATTACH and hidden from kill.
+check_contains "a child that forks before its parent publishes it is registered" \
+    "proctest fork before the parent publishes: y -> OK" "$out"
 check_contains "mounts describes the rootfs and binds" "proctest mounts:" "$out"
 check_contains "mountinfo carries the root device row" "proctest mountinfo:" "$out"
 check_contains "loadavg has the kernel's five fields" "proctest loadavg:" "$out"
@@ -109,11 +114,14 @@ check_contains "uptime is synthesized" "proctest uptime:" "$out"
 # F_GETFL — all refused on the real file (EBADF, EINVAL, EACCES, O_RDONLY). The
 # status flags it did ask for (O_APPEND) still come back from F_GETFL.
 # The only way to a read-only description of a memfd is to reopen it through its
-# own /proc link, and Android's policy refuses that: the driver says so, and the
-# fd stays writable there (documented at synth_seal) — nothing to hold it to.
+# own /proc link, and Android's policy refuses that. There the view is a file of
+# ours instead, in a private directory under $TMPDIR, opened read-only for real
+# and unlinked: Chrome dup()s a child's /proc/<pid>/status and CHECKs that what
+# it hands on is read-only. Only with no such directory either does the fd stay
+# writable (documented at synth_seal), and the driver says so.
 case "$out" in
 *"proctest synth fd is read-only: unavailable"*)
-    skip "synthesized fds are read-only: this host refuses to reopen a memfd, so they stay writable"
+    skip "synthesized fds are read-only: this host refuses to reopen a memfd and has no private temp directory"
     ;;
 *)
     check_contains "a synthesized fd is read-only, with the guest's status flags" \
@@ -121,6 +129,23 @@ case "$out" in
         "$out"
     ;;
 esac
+# The same driver with that reopen taken as refused (CNG_PROCFS_REOPEN_DENY),
+# which is what reaches the files off a device: every check holds as it does
+# from a memfd — content, refresh, identity, the fd link's name — and nothing
+# is left in the directory once the views are closed.
+PTS=$(mktemp -d)
+out=$(TMPDIR="$PTS" CNG_PROCFS_REOPEN_DENY=1 run -t proctest -r "$PT" -b "$PTB":/usr 2>&1); rc=$?
+check "proctest overall, views from files of ours" 0 "$rc"
+check_contains "...read-only for real, with the guest's status flags" \
+    "proctest synth fd is read-only: accmode=0 append=1 write=-9 ftruncate=-22 mmap_rw=-13" \
+    "$out"
+check_contains "...refreshed through the file on a rewind" \
+    "proctest synth fd identity: dev+ino=1 reused number left alone=1 -> OK" "$out"
+check_contains "...and named by its link as the memfd is" \
+    "proctest overflowuid: 6 bytes -> OK" "$out"
+check "...and the directory holds nothing afterwards" "" \
+    "$(ls -A "$PTS/chroot-ng-proc.v1.$(id -u)" 2>&1)"
+rm -rf "$PTS"
 # ...and the open flags are judged as the kernel judges them on the real file,
 # in its order: O_TRUNC is write intent (EACCES on a 0444 file), O_CREAT|O_EXCL
 # is EEXIST on a name that exists, O_DIRECTORY is ENOTDIR, O_DIRECT EINVAL,
@@ -138,9 +163,15 @@ check_contains "synthesized /proc opens judge their flags as the kernel does" \
 # read "/memfd:cng-proc (deleted)". Now the real file's — found again from the
 # memfd's name, so a dup'd fd and a stat through the link agree too, and a
 # held entry of a process that is gone still reads as a /proc regular file.
+# A host with no statx to issue cannot be asked the statx half (statx=-1).
+sfd_needle="proctest synth fd stat: fstat=1 statx=1 fstatfs=1 outlives=1 link=1 dup=1 plain=1 -> OK"
+case "$out" in
+*"proctest synth fd stat: fstat=1 statx=-1 "*)
+    skip "synthesized fd statx: this host has no statx to issue (kernel or ambient filter)"
+    sfd_needle="proctest synth fd stat: fstat=1 statx=-1 fstatfs=1 outlives=1 link=1 dup=1 plain=1 -> OK" ;;
+esac
 check_contains "a synthesized fd stats as the real /proc file, and outlives it" \
-    "proctest synth fd stat: fstat=1 statx=1 fstatfs=1 outlives=1 link=1 dup=1 plain=1 -> OK" \
-    "$out"
+    "$sfd_needle" "$out"
 check_contains "stat falls back to synthesis where the host denies it" \
     "proctest stat:" "$out"
 check_contains "overflowuid is the kernel default, from a memfd, where forced" \
@@ -171,10 +202,18 @@ check_contains "status carries the live credential set, not the startup one" \
 # are the caller, any other pid is found — any thread, not only a leader — or
 # is ESRCH. The fake set used to be synthesized for every non-negative pid, so a
 # pid that named nothing was described as fully capable. Another guest process
-# is described as its status file describes it, under the configured identity;
-# a host process is whatever the kernel says of it.
+# is judged by the ids it publishes, a fake root's being the full set; a host
+# process is whatever the kernel says of it.
 check_contains "capget by pid: ourselves and a guest faked, the rest the kernel's" \
     "proctest capget by pid: self=0/ffffffff tid=0/ffffffff guest=0/ffffffff dead=-3 host=0 neg=-22 none=-3 -> OK" \
+    "$out"
+# What a guest publishes of its ids, which is what a socket peer is told of it
+# (SO_PEERCRED, SCM_CREDENTIALS, SO_PEERGROUPS) and what its status file and
+# /proc directory say: a forked child that drops them is read by all eight
+# and its groups, and has no capabilities to capget; its claim is recorded
+# beside them, and the next change of its set drops the claim.
+check_contains "a guest's published ids follow its drop, and capget with them" \
+    "proctest ids by pid: dropped=1 fake=1 1234/1234/1235/1236:1234/1234/1237/1238 groups=2:7,8 claim=1 0:1234 capget=0/0 changed=1 claim=0 -> OK" \
     "$out"
 check_contains "--no-proc disables passthrough and synthesis" \
     "proctest no-proc -> OK" "$out"
@@ -324,8 +363,20 @@ rm -rf "$PN_ROOT"
 # itself: on a device the refusal is real, and elsewhere CNG_PROC_DENY_STAT=1
 # makes the second run take the same path (/proc/stat and the overflow{u,g}id
 # sysctls, readable here, join it with CNG_PROCSTAT_SYNTH and
-# CNG_OVERFLOWID_SYNTH).
+# CNG_OVERFLOWID_SYNTH). Where the host has no statx at all the guest leaves
+# that form out and says so on a last line, which is taken off and noted.
 PS_ROOT=$(mktemp -d)
+ps_nostatx() {
+    case "$ps_got" in
+    *"
+statx: none on this host")
+        ps_got=${ps_got%"
+statx: none on this host"}
+        [ -n "${ps_noted:-}" ] ||
+            skip "statx of a synthesized /proc file: this host has no statx to issue"
+        ps_noted=1 ;;
+    esac
+}
 if guest_xlate_ready "synthesized /proc stat leg" &&
     guest_cc_report "$PS_ROOT/procstat" tests/guests/procstat.c; then
     ps_want="/proc/version: ok
@@ -336,6 +387,7 @@ if guest_xlate_ready "synthesized /proc stat leg" &&
 /proc/sys/kernel/overflowgid: ok"
     # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
     ps_got=$(run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
+    ps_nostatx
     if [ "$ps_got" = "$ps_want" ]; then
         pass=$((pass + 1))
         echo "  ok   stat and access of a synthesized /proc file agree with the file it is served as"
@@ -347,6 +399,7 @@ if guest_xlate_ready "synthesized /proc stat leg" &&
     # shellcheck disable=SC2086
     ps_got=$(CNG_PROC_DENY_STAT=1 CNG_PROCSTAT_SYNTH=1 CNG_OVERFLOWID_SYNTH=1 \
         run_t 60 -R $GUEST_BINDS "$PS_ROOT" /procstat 2>/dev/null)
+    ps_nostatx
     if [ "$ps_got" = "$ps_want" ]; then
         pass=$((pass + 1))
         echo "  ok   ...and with the host's own refusal of each call forced"
@@ -357,6 +410,79 @@ if guest_xlate_ready "synthesized /proc stat leg" &&
     fi
 fi
 rm -rf "$PS_ROOT"
+
+# cmdline and environ are the process's memory, read when the file is: a title
+# written over argv is what `ps` prints from then on (node's process.title,
+# setproctitle, nginx's and postgres's status lines). They were the registry's
+# exec-time copies, so every one of those read back as the command line the
+# process started with. Now the kernel's own record is pointed at the guest's
+# strings where it takes PR_SET_MM_MAP (a desktop kernel: "record: kernel"),
+# and where it does not (Android, or CNG_MM_MAP_DENY=1) the ranges are read
+# out of the guest's memory under the kernel's rules — ours directly, a child's
+# with process_vm_readv. The guest checks its own files and a forked child's
+# against those rules, which a native host first confirms against the kernel
+# itself. qemu-user has no process_vm_readv for anyone, so on the cross host a
+# child's files are still the copies and only the guest's own are asserted.
+PT_ROOT=$(mktemp -d)
+pt_check() { # desc, want, got
+    if [ "$2" = "$3" ]; then
+        pass=$((pass + 1)); echo "  ok   $1"
+    else
+        fail=$((fail + 1)); echo "  FAIL $1"
+        printf '%s\n' "$2" >"$CNG_TMP/pt.want"
+        printf '%s\n' "$3" >"$CNG_TMP/pt.got"
+        diff "$CNG_TMP/pt.want" "$CNG_TMP/pt.got" | sed 's/^/    /'
+    fi
+}
+if guest_xlate_ready "live cmdline/environ leg" &&
+    guest_cc_report "$PT_ROOT/proctitle" tests/guests/proctitle.c; then
+    pt_legs="start: ok
+start environ: ok
+environ: ok
+kid cmdline: ok
+kid environ: ok
+title: ok
+overflow: ok
+overflow environ: ok"
+    pt_record=ours
+    if [ -n "$QEMU" ]; then
+        pt_legs=$(printf '%s\n' "$pt_legs" | grep -v '^kid ')
+        pt_cut() { grep -v -e '^kid ' -e '^mm_map: '; }
+        skip "a child's live cmdline/environ: qemu-user has no process_vm_readv"
+    else
+        pt_cut() { grep -v '^mm_map: '; }
+        pt_got=$(kref "$PT_ROOT/proctitle" 2>&1)
+        case "$pt_got" in
+        "mm_map: yes"*) pt_record=kernel ;;
+        esac
+        # A kernel before 4.18 ended a title run into the environment at its
+        # NUL and left the NUL out (Android 8's 3.18, measured): no reference
+        # for that leg, which the emulation answers as the 6.1 it advertises.
+        # The rest is still the kernel's to judge.
+        pt_kwant=$pt_legs
+        if printf '%s\n' "$pt_got" |
+            grep -q '^overflow: FAIL got [0-9]* \[\([^]]*\)\] want [0-9]* \[\1|\]$'; then
+            skip "the kernel's cmdline of an overflowing title: the host kernel predates its NUL (4.18), so it is no reference"
+            pt_kwant=$(printf '%s\n' "$pt_legs" | grep -v '^overflow: ')
+            pt_got=$(printf '%s\n' "$pt_got" | grep -v '^overflow: ')
+        fi
+        pt_check "the kernel's own cmdline and environ follow the rules the guest checks" \
+            "record: kernel
+$pt_kwant" "$(printf '%s\n' "$pt_got" | pt_cut)"
+    fi
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split list
+    pt_got=$(run_t 60 -R $GUEST_BINDS "$PT_ROOT" /proctitle 2>/dev/null)
+    pt_check "cmdline and environ are the guest's live strings" \
+        "record: $pt_record
+$pt_legs" "$(printf '%s\n' "$pt_got" | pt_cut)"
+    # shellcheck disable=SC2086
+    pt_got=$(CNG_MM_MAP_DENY=1 run_t 60 -R $GUEST_BINDS "$PT_ROOT" /proctitle \
+        2>/dev/null)
+    pt_check "...and read out of guest memory where the kernel's record stays ours" \
+        "record: ours
+$pt_legs" "$(printf '%s\n' "$pt_got" | pt_cut)"
+fi
+rm -rf "$PT_ROOT"
 
 # --- guest-shell scenarios -------------------------------------------------
 m11_ready=0

@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* Unified IPC broker: one per-namespace daemon serving the guest-PID registry
- * table AND the whole of System V IPC — shared memory, semaphores and message
- * queues.
+ * table, the whole of System V IPC — shared memory, semaphores and message
+ * queues — and the emulated rtnetlink sockets (netlink.c), whose requests it
+ * answers the moment they arrive.
  *
  * Ported from arm64chroot's proctab.c, whose daemon multiplexes both over a
  * single abstract-socket rendezvous. chroot-ng grew the daemon first for
@@ -12,12 +13,16 @@
  *
  * Why a daemon owns the segments at all: Android denies shmget/shmat/shmdt/
  * shmctl outright and has no ownerless tmpfs, so a segment must be an ordinary
- * mappable fd — an anonymous memfd, or a file in a writable dir where
- * memfd_create is unavailable. Somebody has to hold that fd for the lifetime of
- * the segment, and it cannot be a guest process: host fd == guest fd here, so a
- * held fd would be visible to (and closable by) the guest. The daemon holds it
+ * mappable fd — an ashmem region where /dev/ashmem opens, else an anonymous
+ * memfd, or a file in a writable dir where memfd_create is unavailable.
+ * Somebody has to hold that fd for the lifetime of the segment, and it cannot
+ * be a guest process: host fd == guest fd here, so a held fd would be visible
+ * to (and closable by) the guest. The daemon holds it
  * and hands out duplicates over SCM_RIGHTS; an attacher maps the fd it is given
- * and closes it, so a process holds a segment only as a mapping.
+ * and closes it, so a process holds a segment only as a mapping. A host process
+ * gets one the same way, through the libandroid-shmem protocol Termux's X
+ * servers speak: every shmid names a "/dev/shm/%08x" socket the daemon answers
+ * on (broker.c, the libandroid-shmem door).
  *
  * The rendezvous name scopes the namespace:
  *   --shared-proc  per rootfs+uid — every invocation over one rootfs meets at
@@ -34,8 +39,9 @@
  *
  * Clients keep no persistent broker fd: every exchange connects, asks, and
  * closes. The daemon uses the registries themselves as its liveness signal and
- * exits once neither a live guest nor a live segment has anchored the namespace
- * for a grace window — leaving no file, no socket name and no stray fd.
+ * exits once neither a live guest, a live segment nor an open emulated netlink
+ * socket has anchored the namespace for a grace window — leaving no file, no
+ * socket name and no stray fd.
  */
 #ifndef CNG_BROKER_H
 #define CNG_BROKER_H
@@ -66,6 +72,9 @@ enum {
     CNG_REQ_MSGRCV,  /* a grant streams ret payload bytes after the reply */
     CNG_REQ_MSGCTL,
     CNG_REQ_CANCEL,  /* on a parked connection: abandon the wait (-> EINTR) */
+    CNG_REQ_NLSOCK,  /* an emulated netlink socket: the daemon's end of its
+                      * pair rides as SCM_RIGHTS, arg = CNG_NL_F_*; ret = id */
+    CNG_REQ_NLSYNC,  /* id = a netlink socket: serve what is queued on it */
 };
 
 /* One fixed-size request; small enough to be delivered atomically on a local
@@ -122,6 +131,12 @@ void cng_broker_seed_session(void);
  * non-NULL, receives an SCM_RIGHTS fd or -1. Returns 0 on a completed exchange,
  * -1 if no daemon could be reached (the caller then fails the syscall). */
 int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out);
+
+/* The same exchange with `fd_in` riding alongside the request as SCM_RIGHTS
+ * (fd_in < 0: none). The caller's copy stays the caller's to close: the
+ * daemon gets a descriptor of its own. */
+int cng_broker_rpc_fd(struct cng_breq *q, int fd_in, struct cng_bresp *r,
+                      int *fd_out);
 
 /* The same connection, handed over instead of driven: for the exchanges that
  * connect-ask-close cannot express — a payload streaming behind the request, a

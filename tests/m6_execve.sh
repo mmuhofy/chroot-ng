@@ -111,7 +111,7 @@ if guest_cc_report "$ER/hello" tests/guests/hello.c; then
     chmod 755 "$ER"/d? 2>/dev/null || :
 
     NREF=$(mktemp -d)
-    printf '#!/bin/sh\nexit 0\n' >"$NREF/d1"
+    printf '#!%s\nexit 0\n' "$HOST_SH" >"$NREF/d1"
     _d=1
     while [ $_d -lt 8 ]; do
         printf '#!%s/d%d\n' "$NREF" $_d >"$NREF/d$((_d + 1))"
@@ -584,6 +584,45 @@ else
     else
         skip "masked waits: could not build tests/guests/maskwait.c with -pthread"
     fi
+    # The bounce is not for masked waits alone: every trapped call that can
+    # block is made from guest context, or a signal cannot reach it. Made in
+    # the SIGSYS handler, with every signal masked, an accept, a receive, or a
+    # FIFO's open ignored the guest's own handler until it returned, never
+    # failed with EINTR, and outlived SIGTERM. Against the kernel: the handler
+    # runs while the call blocks, SA_RESTART makes the call again and it goes on
+    # waiting, its absence is EINTR, and SIGTERM kills. The AF_UNIX receive with
+    # an address to map back is the one that runs the whole dispatch there. On
+    # the SIGSYS tier the handler must also run on the thread's own stack, as
+    # the kernel delivers it, which takes the dispatch's blocking svc being made
+    # there (`sp`); under -R it still runs on the scratch stack.
+    if guest_cc "$TED/blkcall" tests/guests/blkcall.c -pthread; then
+        cp "$TED/blkcall" "$TED/bin/blkcall"
+        mkdir -p "$TED/tmp"
+        for bc_tier in -R ""; do
+            if [ -z "$bc_tier" ] && [ "$CNG_SECCOMP_LIVE" != 1 ]; then
+                skip "blocking calls on the SIGSYS tier: the seccomp filter is inert on this host"
+                continue
+            fi
+            bc_sp=sp
+            [ -n "$bc_tier" ] && bc_sp=-
+            bc_k=$(emu_t 90 "$TED/blkcall" "$TED/tmp" "$bc_sp" 2>/dev/null)
+            # shellcheck disable=SC2086  # deliberately split arg lists
+            bc_g=$(run_t 120 $bc_tier $GUEST_BINDS "$TED" /bin/blkcall /tmp \
+                "$bc_sp" 2>/dev/null)
+            bc_t=${bc_tier:-the SIGSYS tier}
+            if [ -n "$bc_k" ] && [ "$bc_k" = "$bc_g" ]; then
+                pass=$((pass + 1))
+                echo "  ok   a signal against a blocking call acts as the kernel's ($bc_t)"
+            else
+                fail=$((fail + 1))
+                echo "  FAIL a signal against a blocking call diverges from the kernel ($bc_t)"
+                printf '       kernel: %s\n       guest : %s\n' \
+                    "$(echo "$bc_k" | tr '\n' '|')" "$(echo "$bc_g" | tr '\n' '|')"
+            fi
+        done
+    else
+        skip "blocking calls: could not build tests/guests/blkcall.c with -pthread"
+    fi
 fi
 rm -rf "$TED"
 
@@ -618,6 +657,42 @@ else
             printf '       kernel: %s\n       guest : %s\n' "$se_k" "$se_g"
         fi
     done
+    # ...and with each request held at its delivery for a few milliseconds,
+    # as the scheduler holds a thread on a loaded device. A request that has
+    # been delivered is no longer pending, so another one is delivered on top
+    # of it: told every round, a held thread collected a signal frame a round
+    # until there was no room for the next, and the kernel killed the whole
+    # process with a SIGSEGV (a few chain runs in a hundred on Android 8,
+    # where bionic's alternate stack is 16 KiB). The tracer that holds them is
+    # a native program (dtstall.c), so a host that runs the guest's binaries
+    # through qemu-user, whose host tracer would see the emulator's signals,
+    # has no such run.
+    if [ -n "$QEMU" ]; then
+        skip "de_thread with each request held at delivery: a host tracer under qemu-user sees the emulator's signals, not the guest's"
+    elif ! guest_cc "$SED/dtstall" tests/guests/dtstall.c; then
+        skip "de_thread with each request held at delivery: could not build tests/guests/dtstall.c"
+    else
+        se_k=$(cd "$SED/bin" && emu_t 180 ./spawnexec chain 16 2>/dev/null | grep '^report:')
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+        se_g=$(emu_t 240 "$SED/dtstall" 2 "$BIN" -R $GUEST_BINDS "$SED" /bin/spawnexec chain 16 2>/dev/null)
+        se_rc=$?
+        case "$se_g" in
+        SKIP:*)
+            skip "de_thread with each request held at delivery: ${se_g#SKIP: }"
+            ;;
+        *)
+            se_g=$(printf '%s\n' "$se_g" | grep '^report:')
+            if [ -n "$se_k" ] && [ "$se_k" = "$se_g" ]; then
+                pass=$((pass + 1))
+                printf '  ok   execve reaches every sibling with each request held at delivery (%s)\n' "$se_g"
+            else
+                fail=$((fail + 1))
+                printf '  FAIL execve with each request held at delivery (rc %s)\n' "$se_rc"
+                printf '       kernel: %s\n       guest : %s\n' "$se_k" "$se_g"
+            fi
+            ;;
+        esac
+    fi
 fi
 rm -rf "$SED"
 

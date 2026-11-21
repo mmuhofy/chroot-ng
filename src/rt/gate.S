@@ -28,6 +28,57 @@ cng_syscall6:
     ret
     .size cng_syscall6, . - cng_syscall6
 
+/* long cng_syscall6_on(long a0,a1,a2,a3,a4,a5, long nr, unsigned long sp)
+ *   The same, with the svc made on the stack `sp` (in x7), for a call a
+ *   dispatch makes from guest context on the guest's behalf (dispatch.c,
+ *   reissue_svc): a signal delivered while it blocks lands there. x9 keeps
+ *   ours across the svc, which preserves it, as does any handler's sigreturn.
+ */
+    .global cng_syscall6_on
+    .type cng_syscall6_on, %function
+cng_syscall6_on:
+    mov     x9, sp
+    mov     sp, x7
+    mov     x8, x6
+    svc     #0
+    mov     sp, x9
+    ret
+    .size cng_syscall6_on, . - cng_syscall6_on
+
+/* The kickable wait (ptrace.c, cng_pt_wait_native): an -R guest's blocking
+ * wait4 or waitid, made as the guest issued it — unless a ptrace kick has been
+ * taken since the caller read *kicks as `seen`.
+ *
+ * long cng_wait_unless(long a0, a1, a2, a3, a4, long nr,
+ *                      const unsigned *kicks, unsigned seen)
+ *   a0..a4 in x0..x4, nr in x5 (the svc's sixth argument, which neither call
+ *   reads), kicks in x6, seen in w7.
+ *
+ * The compare covers a kick taken before it; one taken from the compare up to
+ * and including the svc — where the value read is already stale, or a restart
+ * of the svc is pending — has its handler resume here at the bail instead
+ * (cng_pt_kick_taken); and one that interrupts the svc has its -EINTR replaced
+ * the same way. The bail's -512 is CNG_WAIT_KICKED: ERESTARTSYS, which no wait
+ * ever returns to user space. */
+    .global cng_wait_unless
+    .type cng_wait_unless, %function
+cng_wait_unless:
+    mov     x8, x5
+    .global cng_wait_unless_check
+cng_wait_unless_check:
+    ldr     w9, [x6]
+    cmp     w9, w7
+    b.ne    cng_wait_unless_bail
+    .global cng_wait_unless_svc
+cng_wait_unless_svc:
+    svc     #0
+    ret
+    .global cng_wait_unless_bail
+cng_wait_unless_bail:
+    mov     x0, #-512
+    ret
+    .size cng_wait_unless, . - cng_wait_unless
+
 /* The bounce (sigsys.c): a syscall the SIGSYS handler must not run itself —
  * a wait that installs a signal mask of its own for its duration — is run from
  * here instead, in the guest's own context, with the guest's own registers.
@@ -55,3 +106,19 @@ __cng_gate_end:
 cng_bounce_svc_end:
     brk     #0
     .size cng_bounce_wait, . - cng_bounce_wait
+
+/* The same bounce for a call whose dispatch has to run from guest context too
+ * (sigsys.c, BOUNCE_DISP): one with a path or a socket address to translate,
+ * where it is not the guest's own svc that blocks but the one the dispatcher
+ * makes. The handler resumes the thread here with sp at the record; the C side
+ * runs the dispatch on the record as its register file, the way the -R
+ * trampoline runs it on its own, and the completion is the trap above. Past
+ * the gate's end, which this has no svc to be inside of. */
+    .global cng_bounce_dispatch
+    .type cng_bounce_dispatch, %function
+cng_bounce_dispatch:
+    mov     x0, sp                  /* the record */
+    bl      cng_bounce_dispatch_c
+    mov     x8, #160                /* __NR_uname, as above */
+    b       __cng_gate_end
+    .size cng_bounce_dispatch, . - cng_bounce_dispatch

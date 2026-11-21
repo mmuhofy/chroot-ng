@@ -68,6 +68,23 @@ extern const int cng_dev_nnodes;
  * runs and after the host environment is on record. */
 void cng_dev_shm_init(void);
 
+/* A directory of our own, "<stem>.<uid>" under the first usable temp
+ * directory ($TMPDIR, $XDG_RUNTIME_DIR, /data/local/tmp, /tmp): made 0700 if
+ * it is not there, and adopted only if it is ours, private, and in a parent
+ * nobody else can rename it out of. Its host path, as the kernel spells it,
+ * goes into `out`. 0, or -1 where no candidate will do, and then `why` (when
+ * not 0) holds why each one was passed over, "; "-separated, for a warning.
+ * CNG_TMP_ENV_ONLY=1 leaves out the two fixed candidates. The /dev/shm
+ * stand-in lives in one, and so do the read-only views of synthesized /proc
+ * files on a host that will not reopen a memfd (procfs.c). */
+int cng_private_tmp_dir(const char *stem, char *out, size_t sz, char *why,
+                        size_t whysz);
+
+/* 0 unless the host has no /dev/shm and no stand-in could be made for it, so
+ * the guest has none: then why each temp directory was passed over (as
+ * cng_private_tmp_dir's `why`, possibly empty), for cng_run's warning. */
+const char *cng_dev_shm_missing(void);
+
 /* Is there a /dev/shm for the guest at all? Asked by the /proc mount tables,
  * which must not announce a tmpfs the guest cannot then open. */
 int cng_dev_shm_ok(void);

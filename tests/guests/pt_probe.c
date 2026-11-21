@@ -21,8 +21,13 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef NT_PRSTATUS
@@ -888,7 +893,8 @@ static int sc_attachmany(void) {
             w = waitpid(tid, &st, __WALL);
         } while (w < 0 && errno == EINTR);
         if (w != tid || !WIFSTOPPED(st)) {
-            printf("round %d: no stop\n", k);
+            printf("round %d: no stop (wait %d errno %d status %#x)\n", k,
+                   (int)w, w < 0 ? errno : 0, w < 0 ? 0 : st);
             break;
         }
         stopped++;
@@ -1440,6 +1446,629 @@ static int sc_options(void) {
     return 0;
 }
 
+/* NT_PRFPREG, the FP/SIMD register file, at the two kinds of stop a crash
+ * reporter or a debugger meets first: the stop PTRACE_ATTACH makes, and a
+ * syscall stop. crashpad attaches to every thread of a crashed process and
+ * reads this from each; it got EINVAL from every one, because an attach stop
+ * did not keep the signal frame the registers were in, and a stop with no
+ * frame at all (the trampoline tier's) had nowhere else to look.
+ *
+ * One register carries a marker across the tracee's blocking read: set before
+ * the syscall, read back by the tracer at each stop, overwritten by it, and
+ * reported by the tracee once the read returns — so both directions are
+ * checked, and through each kind of stop. Then the length rules every regset
+ * shares (ptrace_regset): a length that is not a whole number of the regset's
+ * units is EINVAL, a longer one is cut to the regset, and iov_len says what was
+ * transferred. */
+#define FP_MARK1 0x1122334455667788ULL
+#define FP_MARK2 0x0badc0de8badf00dULL
+#define FP_MARK3 0x5a5a5a5aa5a5a5a5ULL
+#ifndef NT_PRFPREG
+#define NT_PRFPREG 2
+#endif
+#if defined(__aarch64__)
+#define FP_SIZE 528 /* struct user_fpsimd_state */
+#define FP_REG8 128 /* v8, whose low half the ABI has callers preserve */
+#else
+#define FP_SIZE 512 /* struct user_fpregs_struct */
+#define FP_REG8 288 /* xmm8 */
+#endif
+
+/* Put `mark` in the marker register, say so on `wfd`, then block in read(rfd)
+ * — retried across EINTR without touching the register, so the result does
+ * not depend on whether a stop restarts the read. Returns what the register
+ * held when the read returned. All in asm: nothing the compiler emits may sit
+ * between the marker and the syscalls. */
+static unsigned long long fp_hold(int rfd, int wfd, unsigned long long mark) {
+    char c = 'r';
+    unsigned long long v;
+#if defined(__aarch64__)
+    __asm__ volatile("fmov d8, %[m]\n\t"
+                     "mov x0, %[w]\n\tmov x1, %[b]\n\tmov x2, #1\n\t"
+                     "mov x8, #64\n\t" /* write */
+                     "svc #0\n"
+                     "1:\n\t"
+                     "mov x0, %[r]\n\tmov x1, %[b]\n\tmov x2, #1\n\t"
+                     "mov x8, #63\n\t" /* read */
+                     "svc #0\n\t"
+                     "cmn x0, #4\n\t" /* -EINTR */
+                     "b.eq 1b\n\t"
+                     "fmov %[v], d8"
+                     : [v] "=&r"(v)
+                     : [m] "r"(mark), [w] "r"((long)wfd), [r] "r"((long)rfd),
+                       [b] "r"(&c)
+                     : "x0", "x1", "x2", "x8", "v8", "memory", "cc");
+#else
+    __asm__ volatile("movq %[m], %%xmm8\n\t"
+                     "mov $1, %%eax\n\t" /* write */
+                     "mov %[w], %%rdi\n\tmov %[b], %%rsi\n\tmov $1, %%edx\n\t"
+                     "syscall\n"
+                     "1:\n\t"
+                     "xor %%eax, %%eax\n\t" /* read */
+                     "mov %[r], %%rdi\n\tmov %[b], %%rsi\n\tmov $1, %%edx\n\t"
+                     "syscall\n\t"
+                     "cmp $-4, %%rax\n\t" /* -EINTR */
+                     "je 1b\n\t"
+                     "movq %%xmm8, %[v]"
+                     : [v] "=&r"(v)
+                     : [m] "r"(mark), [w] "r"((long)wfd), [r] "r"((long)rfd),
+                       [b] "r"(&c)
+                     : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "xmm8",
+                       "memory", "cc");
+#endif
+    return v;
+}
+
+/* Read the file and say whether the marker register holds `want`. */
+static void fp_check(pid_t pid, const char *where, unsigned long long want) {
+    unsigned char fp[FP_SIZE + 64];
+    memset(fp, 0, sizeof fp);
+    struct iovec io = {fp, FP_SIZE};
+    errno = 0;
+    long r = ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRFPREG, &io);
+    unsigned long long got;
+    memcpy(&got, fp + FP_REG8, sizeof got);
+    printf("%s: fpregs %s, %s, marker %s\n", where, ptres(r),
+           io.iov_len == FP_SIZE ? "whole" : "short",
+           r == 0 && got == want ? "ok" : "wrong");
+}
+
+static void fp_set(pid_t pid, const char *where, unsigned long long mark) {
+    unsigned char fp[FP_SIZE];
+    struct iovec io = {fp, FP_SIZE};
+    ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRFPREG, &io);
+    memcpy(fp + FP_REG8, &mark, sizeof mark);
+    io.iov_len = FP_SIZE;
+    errno = 0;
+    long r = ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRFPREG, &io);
+    printf("%s: fpregs write %s, %s\n", where, ptres(r),
+           io.iov_len == FP_SIZE ? "whole" : "short");
+}
+
+/* GETREGSET with `len`, reported as what came back. */
+static void fp_len(pid_t pid, long type, const char *name, size_t len,
+                   size_t full) {
+    unsigned char buf[FP_SIZE + 64];
+    struct iovec io = {buf, len};
+    errno = 0;
+    long r = ptrace(PTRACE_GETREGSET, pid, (void *)type, &io);
+    const char *asked = len == full + 64 ? "full+64" : len == 3 ? "3" : "16";
+    if (r != 0)
+        printf("%s len %s: %s\n", name, asked, ptres(r));
+    else
+        printf("%s len %s: iov_len %s\n", name, asked,
+               io.iov_len == full  ? "full"
+               : io.iov_len == len ? "as asked"
+                                   : "other");
+}
+
+static int sc_fpregs(void) {
+    int in[2], ready[2], rep[2];
+    if (pipe(in) != 0 || pipe(ready) != 0 || pipe(rep) != 0)
+        return 1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        unsigned long long v = fp_hold(in[0], ready[1], FP_MARK1);
+        ssize_t ignore = write(rep[1], &v, sizeof v);
+        (void)ignore;
+        _exit(0);
+    }
+    char c;
+    if (read(ready[0], &c, 1) != 1)
+        return 1;
+    /* The marker is in place once the byte is: wait for the read to block,
+     * though the checks below hold wherever the attach lands. */
+    usleep(100000);
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0) {
+        printf("attach failed %d\n", errno);
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    int st;
+    wait_for(pid, &st);
+    printf("attach %s\n",
+           (WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP) ? "stopped" : "odd");
+    fp_check(pid, "attach stop", FP_MARK1);
+    fp_len(pid, NT_PRFPREG, "fpregs", 3, FP_SIZE);
+    fp_len(pid, NT_PRFPREG, "fpregs", 16, FP_SIZE);
+    fp_len(pid, NT_PRFPREG, "fpregs", FP_SIZE + 64, FP_SIZE);
+    fp_len(pid, NT_PRSTATUS, "prstatus", 3, sizeof(struct uregs));
+    fp_len(pid, NT_PRSTATUS, "prstatus", 16, sizeof(struct uregs));
+    fp_len(pid, NT_PRSTATUS, "prstatus", sizeof(struct uregs) + 64,
+           sizeof(struct uregs));
+    fp_set(pid, "attach stop", FP_MARK2);
+    fp_check(pid, "attach stop", FP_MARK2);
+    /* On to the read's entry stop, which the write must have survived. */
+    ptrace(PTRACE_SYSCALL, pid, 0, 0);
+    wait_for(pid, &st);
+    printf("syscall stop %s\n",
+           (WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP) ? "reached" : "odd");
+    fp_check(pid, "syscall stop", FP_MARK2);
+    fp_set(pid, "syscall stop", FP_MARK3);
+    /* Let the read return, and hear from the tracee what the register held
+     * when it did. */
+    ssize_t ignore = write(in[1], "x", 1);
+    (void)ignore;
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    unsigned long long v = 0;
+    ssize_t n = read(rep[0], &v, sizeof v);
+    printf("tracee saw %s\n",
+           n != (ssize_t)sizeof v ? "nothing"
+           : v == FP_MARK3        ? "the last write"
+           : v == FP_MARK2        ? "the attach stop's write"
+           : v == FP_MARK1        ? "its own marker"
+                                  : "garbage");
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
+/* PTRACE_ATTACH to a thread blocked in a syscall — the state a crash reporter
+ * or a debugger finds most threads in. The kernel stops it mid-call and shows
+ * the call as one it is going to restart: the registers are the thread's own,
+ * its arguments in place, pc at the syscall instruction (arm64 rewinds before
+ * the stop; x86-64 after it, so there it is still past the instruction), and
+ * when the stop ends the call is made again — with whatever the tracer left in
+ * the registers. It did not look like that here: a call the emulation was
+ * making for the thread showed chroot-ng's own pc and sp; one made in the
+ * SIGSYS handler could not be stopped at all until it returned, the attach
+ * hanging meanwhile; and the kick that does the stopping ended the call with
+ * EINTR instead of letting it restart.
+ *
+ * Two calls, through one svc of a known address: a read on a pipe, which the
+ * seccomp tier leaves native, and an accept, which it traps. The tracer checks
+ * the registers, points the read at another pipe, and lets both go; the
+ * tracee reports what each call returned. */
+#if defined(__aarch64__)
+#define R_ARG0(r)        ((r).x[0])
+#define R_SP(r)          ((r).sp)
+#define R_BLOCKED_PC(at) (at)
+#define NR_READ          63
+#define NR_ACCEPT4       242
+#else
+#define R_ARG0(r)        ((r).rdi)
+#define R_SP(r)          ((r).rsp)
+#define R_BLOCKED_PC(at) ((at) + 2)
+#define NR_READ          0
+#define NR_ACCEPT4       288
+#endif
+
+extern char blk_svc[];
+
+/* The one syscall instruction both calls are made through, at blk_svc. */
+__attribute__((noinline)) static long blk_call(long nr, long a0, long a1,
+                                               long a2) {
+#if defined(__aarch64__)
+    register long x0 __asm__("x0") = a0;
+    register long x1 __asm__("x1") = a1;
+    register long x2 __asm__("x2") = a2;
+    register long x3 __asm__("x3") = 0;
+    register long x8 __asm__("x8") = nr;
+    __asm__ volatile(".globl blk_svc\nblk_svc:\n\tsvc #0"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3), "r"(x8)
+                     : "memory");
+    return x0;
+#else
+    long ret;
+    register long r10 __asm__("r10") = 0;
+    __asm__ volatile(".globl blk_svc\nblk_svc:\n\tsyscall"
+                     : "=a"(ret)
+                     : "a"(nr), "D"(a0), "S"(a1), "d"(a2), "r"(r10)
+                     : "rcx", "r11", "memory");
+    return ret;
+#endif
+}
+
+static pid_t blk_child;
+static void blk_hung(int s) {
+    (void)s;
+    printf("attach hung\n");
+    kill(blk_child, SIGKILL);
+    _exit(1);
+}
+
+/* Attach to `pid`, blocked in blk_call with `fd` as its first argument and
+ * its stack around `near`, and report the stop. */
+static int blk_attach(pid_t pid, long fd, unsigned long near) {
+    blk_child = pid;
+    signal(SIGALRM, blk_hung);
+    alarm(20);
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0) {
+        printf("attach failed %d\n", errno);
+        return -1;
+    }
+    int st;
+    wait_for(pid, &st);
+    alarm(0);
+    printf("attach %s\n",
+           (WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP) ? "stopped" : "odd");
+    struct uregs r;
+    if (getregs(pid, &r) != 0) {
+        printf("getregs failed %d\n", errno);
+        return -1;
+    }
+    unsigned long sp = (unsigned long)R_SP(r);
+    printf("pc where the kernel shows a blocked call: %s\n",
+           R_PC(r) == (unsigned long long)R_BLOCKED_PC((unsigned long)blk_svc)
+               ? "yes"
+               : "no");
+    printf("arg0 the fd: %s\n", (long)R_ARG0(r) == fd ? "yes" : "no");
+    printf("sp the thread's own: %s\n",
+           sp <= near && near - sp < 65536 ? "yes" : "no");
+    return 0;
+}
+
+/* Block every signal in the calling thread, as GLib's threads do: no mask
+ * holds back the kernel's SIGSTOP, so an attach stops such a thread all the
+ * same. The one the emulation stops threads with is an ordinary signal, which
+ * a thread like this held pending for good — a crashed Chrome hung on its gmain
+ * thread, crashpad waiting for the stop. */
+static void block_all(void) {
+    sigset_t all;
+    sigfillset(&all);
+    sigprocmask(SIG_SETMASK, &all, 0);
+}
+
+static int sc_blocked(int mask) {
+    /* The read: on pipe a, redirected by the tracer to pipe b. */
+    int a[2], b[2], ready[2], rep[2];
+    if (pipe(a) != 0 || pipe(b) != 0 || pipe(ready) != 0 || pipe(rep) != 0)
+        return 1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (mask)
+            block_all();
+        unsigned long here = (unsigned long)&here;
+        ssize_t ignore = write(ready[1], &here, sizeof here);
+        char c = 0;
+        long n = blk_call(NR_READ, a[0], (long)&c, 1);
+        long out[2] = {n, c};
+        ignore = write(rep[1], out, sizeof out);
+        (void)ignore;
+        _exit(0);
+    }
+    unsigned long near = 0;
+    if (read(ready[0], &near, sizeof near) != sizeof near)
+        return 1;
+    usleep(200000); /* asleep in the read by now */
+    if (blk_attach(pid, a[0], near) != 0) {
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    struct uregs r;
+    getregs(pid, &r);
+    R_ARG0(r) = (unsigned long long)b[0];
+    printf("redirect to the other pipe: %s\n", setregs(pid, &r) == 0 ? "ok" : "failed");
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    ssize_t ignore = write(b[1], "B", 1);
+    ignore = write(a[1], "A", 1);
+    (void)ignore;
+    long out[2] = {0, 0};
+    if (read(rep[0], out, sizeof out) != sizeof out)
+        return 1;
+    printf("read returned %s\n",
+           out[0] == 1 && out[1] == 'B' ? "the other pipe's byte"
+           : out[0] == 1               ? "the first pipe's byte"
+           : out[0] == -EINTR          ? "EINTR"
+                                       : "something else");
+    int st;
+    wait_for(pid, &st);
+    show(st);
+
+    /* The accept: on a listening socket of its own, let go untouched, and
+     * then given a connection. */
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t sl = sizeof sa;
+    if (ls < 0 || bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 ||
+        listen(ls, 1) != 0 || getsockname(ls, (struct sockaddr *)&sa, &sl) != 0)
+        return 1;
+    pid = fork();
+    if (pid == 0) {
+        if (mask)
+            block_all();
+        unsigned long here = (unsigned long)&here;
+        ssize_t ignore = write(ready[1], &here, sizeof here);
+        long n = blk_call(NR_ACCEPT4, ls, 0, 0);
+        long out[2] = {n, 0};
+        ignore = write(rep[1], out, sizeof out);
+        (void)ignore;
+        _exit(0);
+    }
+    if (read(ready[0], &near, sizeof near) != sizeof near)
+        return 1;
+    usleep(200000);
+    if (blk_attach(pid, ls, near) != 0) {
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    ptrace(PTRACE_DETACH, pid, 0, 0);
+    int cs = socket(AF_INET, SOCK_STREAM, 0);
+    if (cs < 0 || connect(cs, (struct sockaddr *)&sa, sizeof sa) != 0)
+        return 1;
+    if (read(rep[0], out, sizeof out) != sizeof out)
+        return 1;
+    printf("accept returned %s\n", out[0] >= 0         ? "a connection"
+                                   : out[0] == -EINTR ? "EINTR"
+                                                      : "an error");
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
+/* ...and a thread with every signal blocked that never sleeps, making calls
+ * the seccomp tier traps (a mkdir and an rmdir of one directory) as fast as it
+ * can, attached and detached a hundred times. Each attach must stop it. And
+ * none may cost it a call or make one twice: on the seccomp tier the stop is
+ * sent as a SIGSYS of ours, a SIGSYS pending when the thread traps absorbs the
+ * trap's, and the call the kernel then skips returns its own first argument
+ * (AT_FDCWD, -100) unless it is made again — but not one a handler of ours
+ * already made, which a second mkdir would answer EEXIST. The thread counts
+ * the calls that answered anything but 0. */
+#define SPIN_ROUNDS 100
+
+static int sc_blockspin(const char *self) {
+    char dir[4096];
+    snprintf(dir, sizeof dir, "%s.spin.d", self);
+    rmdir(dir);
+    volatile unsigned long *shared =
+        mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shared == MAP_FAILED)
+        return 1;
+    shared[0] = shared[1] = 0; /* calls made, calls that answered wrongly */
+    pid_t pid = fork();
+    if (pid == 0) {
+        block_all();
+        for (;;) {
+            if (syscall(SYS_mkdirat, AT_FDCWD, dir, 0700) != 0)
+                shared[1]++;
+            if (syscall(SYS_unlinkat, AT_FDCWD, dir, AT_REMOVEDIR) != 0)
+                shared[1]++;
+            shared[0]++;
+        }
+    }
+    while (shared[0] < 100)
+        usleep(1000);
+    int stopped = 0;
+    signal(SIGALRM, blk_hung);
+    blk_child = pid;
+    for (int i = 0; i < SPIN_ROUNDS; i++) {
+        alarm(20);
+        if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0)
+            break;
+        int st;
+        wait_for(pid, &st);
+        alarm(0);
+        if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP)
+            stopped++;
+        ptrace(PTRACE_DETACH, pid, 0, 0);
+        unsigned long seen = shared[0];
+        while (shared[0] == seen) /* running again before the next attach */
+            usleep(100);
+    }
+    printf("attached to a spinning thread with every signal blocked: %s\n",
+           stopped == SPIN_ROUNDS ? "stopped every time" : "missed stops");
+    printf("every call it made answered as it should: %s\n",
+           shared[1] ? "no" : "yes");
+    kill(pid, SIGKILL);
+    int st;
+    wait_for(pid, &st);
+    show(st);
+    rmdir(dir);
+    return 0;
+}
+
+/* Tasks a tracee makes after the attach, which the tracer does not follow:
+ * a thread (no PTRACE_O_TRACECLONE) and a fork child (no TRACEFORK). The
+ * kernel runs both as any untraced task. chroot-ng's tracee filter traps every
+ * call, and a thread's clone and a fork both hand it on, but not the record
+ * that says the task carries it: every call the dispatcher does not handle
+ * itself (sched_yield, getpid, write) came back ENOSYS in the new task. Each
+ * makes a handful and counts the ones that failed. */
+static int after_calls(int fd) {
+    int bad = 0;
+    struct timespec ts = {0, 1000};
+    bad += syscall(SYS_getpid) <= 0;
+    bad += syscall(SYS_getppid) <= 0;
+    bad += syscall(SYS_gettid) <= 0;
+    bad += syscall(SYS_sched_yield) != 0;
+    bad += syscall(SYS_nanosleep, &ts, 0) != 0;
+    bad += syscall(SYS_write, fd, "x", 1) != 1;
+    void *m = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    bad += m == MAP_FAILED || munmap(m, 4096) != 0;
+    int d = dup(fd);
+    bad += d < 0 || close(d) != 0;
+    return bad;
+}
+
+static volatile int *g_after;
+static int g_after_fd;
+
+static void *after_thr(void *a) {
+    (void)a;
+    g_after[0] = after_calls(g_after_fd);
+    g_after[1] = 1;
+    return 0;
+}
+
+/* `tracee_work` runs in the tracee once its tracer has attached and let it
+ * go; the tracer then follows it to its exit. */
+static int after_run(void (*tracee_work)(void), const char *what) {
+    int go[2], sink[2];
+    if (pipe(go) != 0 || pipe(sink) != 0)
+        return 1;
+    g_after = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+                   -1, 0);
+    if (g_after == MAP_FAILED)
+        return 1;
+    g_after[0] = -1;
+    g_after[1] = 0;
+    g_after_fd = sink[1];
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        if (read(go[0], &c, 1) != 1)
+            _exit(3);
+        tracee_work();
+        _exit(g_after[1] ? 0 : 4);
+    }
+    int st;
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0) {
+        printf("attach failed %d\n", errno);
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    wait_for(pid, &st);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    if (write(go[1], "g", 1) != 1)
+        return 1;
+    for (;;) {
+        wait_for(pid, &st);
+        if (!WIFSTOPPED(st))
+            break;
+        ptrace(PTRACE_CONT, pid, 0,
+               WSTOPSIG(st) == SIGSTOP || WSTOPSIG(st) == SIGTRAP
+                   ? 0
+                   : WSTOPSIG(st));
+    }
+    printf("%s made its calls: %s\n", what,
+           !g_after[1]   ? "never ran"
+           : g_after[0] ? "some failed"
+                        : "yes");
+    show(st);
+    return 0;
+}
+
+static void after_thread(void) {
+    pthread_t t;
+    if (pthread_create(&t, 0, after_thr, 0) == 0)
+        pthread_join(t, 0);
+}
+
+static void after_fork(void) {
+    pid_t g = fork();
+    if (g == 0) {
+        after_thr(0);
+        _exit(0);
+    }
+    int st;
+    while (waitpid(g, &st, 0) < 0 && errno == EINTR)
+        ;
+}
+
+static int sc_threadafter(void) {
+    return after_run(after_thread, "a thread made after the attach");
+}
+
+static int sc_forkafter(void) {
+    return after_run(after_fork, "a fork child made after the attach");
+}
+
+/* blockspin's attach, to a thread made after its process was attached to:
+ * one that carries the tracee's filter it inherited and no record of it. It
+ * blocks every signal, so each attach reaches it as a SIGSYS of ours, and
+ * spins on a call that only the inherited filter traps: lseek by one on a
+ * file of its own, whose answer is the new offset. A call the SIGSYS displaced and that is not made
+ * again answers its first argument; one made twice moves the offset by two. */
+static volatile long *g_spin_sh;
+
+static void *spin_thr(void *a) {
+    int fd = (int)(long)a;
+    block_all();
+    g_spin_sh[2] = syscall(SYS_gettid);
+    for (long want = 1;; want++) {
+        if (syscall(SYS_lseek, fd, 1L, SEEK_CUR) != want) {
+            g_spin_sh[1]++;
+            want = lseek(fd, 0, SEEK_CUR);
+        }
+        g_spin_sh[0]++;
+    }
+    return 0;
+}
+
+static int sc_spinafter(const char *self) {
+    g_spin_sh = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+                     -1, 0);
+    int go[2];
+    if (g_spin_sh == MAP_FAILED || pipe(go) != 0)
+        return 1;
+    g_spin_sh[0] = g_spin_sh[1] = g_spin_sh[2] = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        char c;
+        int fd = open(self, O_RDONLY);
+        if (fd < 0 || read(go[0], &c, 1) != 1)
+            _exit(3);
+        pthread_t t;
+        pthread_create(&t, 0, spin_thr, (void *)(long)fd);
+        for (;;)
+            pause();
+    }
+    int st;
+    if (ptrace(PTRACE_ATTACH, pid, 0, 0) != 0) {
+        printf("attach failed %d\n", errno);
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    wait_for(pid, &st);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    if (write(go[1], "g", 1) != 1)
+        return 1;
+    while (g_spin_sh[0] < 100)
+        usleep(1000);
+    pid_t tid = (pid_t)g_spin_sh[2];
+    int stopped = 0;
+    signal(SIGALRM, blk_hung);
+    blk_child = pid;
+    for (int i = 0; i < SPIN_ROUNDS; i++) {
+        alarm(20);
+        if (ptrace(PTRACE_ATTACH, tid, 0, 0) != 0)
+            break;
+        while (waitpid(tid, &st, __WALL) < 0 && errno == EINTR)
+            ;
+        alarm(0);
+        if (WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP)
+            stopped++;
+        ptrace(PTRACE_DETACH, tid, 0, 0);
+        long seen = g_spin_sh[0];
+        while (g_spin_sh[0] == seen)
+            usleep(100);
+    }
+    printf("attached to a thread made after its process was: %s\n",
+           stopped == SPIN_ROUNDS ? "stopped every time" : "missed stops");
+    printf("every call it made answered as it should: %s\n",
+           g_spin_sh[1] ? "no" : "yes");
+    kill(pid, SIGKILL);
+    wait_for(pid, &st);
+    show(st);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, 0, _IOLBF, 0);
     if (argc > 1 && !strcmp(argv[1], "hello")) {
@@ -1499,6 +2128,20 @@ int main(int argc, char **argv) {
         return sc_waitnowait();
     if (!strcmp(s, "options"))
         return sc_options();
+    if (!strcmp(s, "fpregs"))
+        return sc_fpregs();
+    if (!strcmp(s, "blocked"))
+        return sc_blocked(0);
+    if (!strcmp(s, "blockedmask"))
+        return sc_blocked(1);
+    if (!strcmp(s, "blockspin"))
+        return sc_blockspin(argc > 2 ? argv[2] : argv[0]);
+    if (!strcmp(s, "threadafter"))
+        return sc_threadafter();
+    if (!strcmp(s, "forkafter"))
+        return sc_forkafter();
+    if (!strcmp(s, "spinafter"))
+        return sc_spinafter(argc > 2 ? argv[2] : argv[0]);
     fprintf(stderr, "unknown scenario %s\n", s);
     return 2;
 }

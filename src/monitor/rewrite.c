@@ -4,6 +4,7 @@
 #include "cng/elf.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/ptrace.h"
 #include "cng/rt.h"
 #include "cng/syscall.h"
 #include "cng/tab.h"
@@ -23,8 +24,10 @@ extern char cng_svc_tramp_back[];
 #define SVC0_INSN    0xD4000001u /* `svc #0` */
 #define B_OPCODE     0x14000000u /* unconditional branch */
 #define BRANCH_REACH (1L << 27)  /* +-128 MiB */
-#define MOVZ_X8_MASK 0xFFE0001Fu /* movz x8, #imm16 (hw=0) */
-#define MOVZ_X8      0xD2800008u
+/* movz x8 or w8, #imm16 (hw=0): the width bit is left out, since bionic loads
+ * its syscall numbers as `mov w8, #nr`, and musl and glibc as `mov x8, #nr`. */
+#define MOVZ_X8_MASK 0x7FE0001Fu
+#define MOVZ_X8      0x52800008u
 #define NR_RT_SIGRETURN 139u
 #define NR_MUNMAP       215u
 #define NR_EXIT         93u
@@ -189,8 +192,8 @@ static int writes_x8(uint32_t w) {
     return 0;
 }
 
-/* Is the word at `a` an `svc #0` with `mov x8, #nr` in the word before it? Reads
- * `a - 4` and `a`, so the caller keeps both inside the mapping. */
+/* Is the word at `a` an `svc #0` with `mov x8, #nr` (or w8) in the word before
+ * it? Reads `a - 4` and `a`, so the caller keeps both inside the mapping. */
 static int svc_nr(unsigned long a, unsigned long floor, unsigned nr) {
     if (a < floor + 4 || *(uint32_t *)a != SVC0_INSN)
         return 0;
@@ -201,7 +204,9 @@ static int svc_nr(unsigned long a, unsigned long floor, unsigned nr) {
 /* One of the two `svc` of a thread freeing its own stack: unmap the stack it is
  * standing on, then exit. musl's __unmapself is exactly
  *     mov x8,#215; svc 0; mov x8,#93; svc 0
- * and bionic's _exit_with_stack_teardown has a `mov x0,#0` between them. The
+ * and bionic's _exit_with_stack_teardown has a `mov x0,#0` between them and
+ * the numbers in w8 (Android 8 to 15 alike), which went unrecognised while
+ * only x8 was matched. The
  * munmap is told from the others by the exit that follows it, and the exit by
  * the munmap before it, so that a program's ordinary munmap and exit are as
  * they were. `hi` bounds the look ahead, which is the only read that could
@@ -320,6 +325,106 @@ int cng_rewrite_seg(unsigned long lo, unsigned long hi, unsigned long foff,
                       pool, cap, used);
     }
     return count;
+}
+
+/* ---- a ptrace kick inside a trampoline -----------------------------------
+ *
+ * A kick can land on any instruction of a copy, and its frame is then neither
+ * the guest's nor the dispatcher's: sp lowered over the trampoline's frame,
+ * x16/x17 and the flags spent on the clone test, x0 on the call. A stop needs
+ * the guest's state, and it is all there: up to the call the trampoline has
+ * only saved, so the guest's state is that of a call not yet made, at the
+ * site's branch; after it the frame holds the guest's state as the dispatch
+ * left it, which is the call made. The copy is recognized by its words (only
+ * the two branches and the literals differ from the template), so nothing has
+ * to keep a list of pools. */
+extern char cng_svc_tramp_clone[];
+extern char cng_svc_tramp_call[];
+extern char cng_svc_tramp_gen[];
+
+#define TRAMP_WORDS 128 /* comfortably more than the template has */
+
+/* Is `w` (the template's size, read from a candidate copy) a trampoline? */
+static int tramp_is_copy(const uint32_t *w) {
+    const uint32_t *t = (const uint32_t *)cng_svc_tramp_tpl;
+    unsigned long code = (unsigned long)(cng_svc_tramp_disp - cng_svc_tramp_tpl);
+    unsigned long b1 = (unsigned long)(cng_svc_tramp_clone - cng_svc_tramp_tpl) + 4,
+                  b2 = (unsigned long)(cng_svc_tramp_back - cng_svc_tramp_tpl);
+    for (unsigned long o = 0; o < code; o += 4) {
+        if (o == b1 || o == b2) {
+            if ((w[o / 4] & 0xFC000000u) != B_OPCODE)
+                return 0;
+        } else if (w[o / 4] != t[o / 4]) {
+            return 0;
+        }
+    }
+    return *(const unsigned long *)((const char *)w + code) ==
+           (unsigned long)&cng_tramp_dispatch;
+}
+
+int cng_tramp_unwind(struct cng_uregs *u) {
+    unsigned long tsz = cng_tramp_size();
+    if (tsz > TRAMP_WORDS * 4 || (u->pc & 3))
+        return 0;
+    uint32_t cur;
+    if (cng_user_copyin(&cur, (const void *)u->pc, 4) < 0)
+        return 0;
+    const uint32_t *t = (const uint32_t *)cng_svc_tramp_tpl;
+    unsigned long code = (unsigned long)(cng_svc_tramp_disp - cng_svc_tramp_tpl);
+    unsigned long clone = (unsigned long)(cng_svc_tramp_clone - cng_svc_tramp_tpl),
+                  call = (unsigned long)(cng_svc_tramp_call - cng_svc_tramp_tpl),
+                  back = (unsigned long)(cng_svc_tramp_back - cng_svc_tramp_tpl),
+                  gen = (unsigned long)(cng_svc_tramp_gen - cng_svc_tramp_tpl),
+                  ret = (unsigned long)(cng_svc_tramp_ret - cng_svc_tramp_tpl);
+    for (unsigned long o = 0; o < code; o += 4) {
+        int br = o == clone + 4 || o == back;
+        if (br ? (cur & 0xFC000000u) != B_OPCODE : cur != t[o / 4])
+            continue;
+        uint32_t w[TRAMP_WORDS];
+        if (cng_user_copyin(w, (const void *)(u->pc - o), tsz) < 0 ||
+            !tramp_is_copy(w))
+            continue;
+        u64 site4 = *(const u64 *)((const char *)w + ret); /* S+4 */
+        if (o == clone + 4 || o == back) {
+            u->pc = site4; /* the call is over and every register restored */
+            return 1;
+        }
+        if (o == gen + 20) {
+            u->pc = u->x[16]; /* `br x16`: only pc is left to set */
+            return 1;
+        }
+        /* Up to the call: the guest's registers are the live ones, except
+         * what the trampoline has spent and saved so far. At the clone's svc
+         * everything is back already, and before the first save nothing has
+         * been spent but sp. */
+        if (o == clone || o < 8) {
+            if (o != clone && o >= 4)
+                u->sp += 288;
+            u->pc = site4 - 4;
+            return 1;
+        }
+        struct cng_uregs f; /* the trampoline's frame, at sp */
+        if (cng_user_copyin(&f, (const void *)u->sp, sizeof f) < 0)
+            return 0;
+        u64 nzcv = f.pstate & 0xF0000000ull;
+        if (o > call) {
+            /* The dispatch has returned and the epilogue is restoring from the
+             * frame: what it ends with is the frame, sp and pc included. */
+            f.pstate = (u->pstate & ~0xF0000000ull) | nzcv;
+            *u = f;
+            return 1;
+        }
+        u->sp += 288;
+        u->x[16] = f.x[16];
+        u->x[17] = f.x[17];
+        if (o >= 20) /* the clone test has spent the flags */
+            u->pstate = (u->pstate & ~0xF0000000ull) | nzcv;
+        if (o >= call - 4) /* `mov x0, sp` is made */
+            u->x[0] = f.x[0];
+        u->pc = site4 - 4;
+        return 1;
+    }
+    return 0;
 }
 
 /* ---- lazy rewriting: the site the CPU just trapped from ------------------

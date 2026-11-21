@@ -188,6 +188,29 @@ if guest_xlate_ready "threads-under-rewrite leg" &&
     fi
 fi
 
+# A wait under -R is the kernel's own unless something could owe it an emulated
+# ptrace stop. It used to be made out of 50 ms polls of the ptrace registry for
+# every guest: 51 ms per fork and waitpid, and a signal handler without
+# SA_RESTART that ran during the wait did not end it with EINTR, as the
+# kernel's does. Differential against the same program under the kernel.
+if guest_xlate_ready "waits-under-rewrite leg" &&
+    guest_cc_report "$ROOT/bin/waitintr" tests/guests/waitintr.c -lpthread; then
+    want=$(emu_t 60 "$ROOT/bin/waitintr" 2>/dev/null)
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 90 $GUEST_BINDS -R "$ROOT" /bin/waitintr 2>/dev/null)
+    if [ -z "$want" ]; then
+        skip "waits under -R: the reference run produced nothing"
+    elif [ "$want" = "$out" ]; then
+        pass=$((pass + 1))
+        echo "  ok   waits under -R are interrupted and restarted as the kernel's"
+    else
+        fail=$((fail + 1))
+        echo "  FAIL waits under -R diverge from the kernel"
+        printf '       kernel: %s\n       guest : %s\n' \
+            "$(echo "$want" | tr '\n' '|')" "$(echo "$out" | tr '\n' '|')"
+    fi
+fi
+
 # execve from a rewritten svc site must be emulated in-process (translated,
 # monitor kept), not re-issued raw — raw would exec the untranslated guest path
 # on the host and fail with ENOENT.
@@ -220,8 +243,13 @@ if guest_xlate_ready "vfork-under-rewrite leg" &&
     check_contains "a bare vfork child exits on the parent's stack" \
         "vfork-exit: exited 7" "$out"
     check_contains "a vfork child execs" "vfork-exec: exited 42" "$out"
-    check_contains "a posix_spawn child resumes on its own stack and execs" \
-        "spawn-exec: exited 42" "$out"
+    case "$out" in
+    *"posix_spawn: none in this libc"*)
+        skip "posix_spawn under -R: the guest's libc has none (bionic before API 28)" ;;
+    *)
+        check_contains "a posix_spawn child resumes on its own stack and execs" \
+            "spawn-exec: exited 42" "$out" ;;
+    esac
     check_contains "the exec'd program got its argv" "argv1=from-vforker" "$out"
     if [ -n "$want" ]; then
         check "and the outcomes match the same program under the kernel" \

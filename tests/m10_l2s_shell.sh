@@ -92,6 +92,30 @@ if [ "$m10_ready" -eq 1 ]; then
         'cd /tmp; mkdir -p t/x t/y; echo hi>t/x/a; ln t/x/a t/x/b;
          ln t/x/a t/y/c; rm -rf t; echo rc=$?; ls -a'
 
+    # link(2) of a symlink links the symlink: a second name with the same
+    # text and times, followed by neither (the count is the one divergence,
+    # so it is not printed). The fallback opened the source and drew ELOOP.
+    l2s_diff "ln of a symlink links the symlink" \
+        'cd /tmp; echo hi>a; ln -s a sl; touch -h -d "2020-01-02 03:04:05" sl;
+         ln sl sl2; echo rc=$?; stat -c "%F %Y" sl sl2; readlink sl2; cat sl2;
+         mkdir d; ln sl d/sl3; readlink d/sl3; cat d/sl3; echo rc=$?'
+
+    # rename(2) of a name onto another name of the same file does nothing:
+    # both names stay and the count is unchanged. The host saw two symlinks
+    # and moved one over the other.
+    l2s_diff "mv between two names of one file does nothing" \
+        'cd /tmp; echo x>m; ln m n; mv m n; echo mv=$?; ls m n; stat -c %h m n;
+         mkdir d; ln n d/o; mv d/o m; echo mv=$?; ls m n d; stat -c %h m n d/o;
+         echo y>p; mv p n; echo mv=$?; stat -c %h m n d/o; cat n d/o'
+
+    # A FIFO's names are one pipe: what is written to one is read from the
+    # other. The fallback opened the FIFO to copy it and hung.
+    l2s_diff "ln of a FIFO: both names are one pipe" \
+        'cd /tmp; mkfifo f; ln f g; echo rc=$?; stat -c "%h %F" f g;
+         [ "$(stat -c %i f)" = "$(stat -c %i g)" ] && echo same-ino;
+         (echo hi > f &); cat g; mkdir d; ln g d/h; stat -c %h f;
+         rm f; stat -c "%h %F" g d/h; rm g d/h; ls -a'
+
     l2s_diff "double ln refuses with EEXIST" \
         'cd /tmp; echo hi>a; ln a b; ln a b 2>&1; echo rc=$?'
 
@@ -182,6 +206,66 @@ if [ "$m10_ready" -eq 1 ]; then
     rm -rf "$RO" "$REM"
 fi
 
+# proot-distro's groups. A rootfs installed through proot-distro holds the
+# hardlinks proot made: every name a symlink holding the HOST path of an
+# indirection symlink in "<rootfs>/.l2s", which names the data file beside it,
+# "<indirection>.<CCCC>", CCCC the live count. They are laid down here by hand
+# as proot writes them, and for the oracle as the real hardlinks they stand
+# for; the same script must print the same bytes. A third group's texts name
+# an old rootfs path (a moved tree), a fourth is proot's layout without
+# PROOT_L2S_DIR (the chain beside the first name). Then the tree must be what
+# proot itself would leave, so it goes on working under proot: the counts in
+# the names, the indirections naming the data, the moved group's texts
+# repointed, the groups whose last name went gone. Before, every name was a
+# symlink dangling into "<rootfs><rootfs>/.l2s".
+if [ "$m10_ready" -eq 1 ]; then
+    RO=$(mktemp -d); REM=$(mktemp -d)
+    cp -a "$M10_ALPINE/." "$RO"; cp -a "$M10_ALPINE/." "$REM"
+    P=$(cd "$REM" && pwd -P)
+    mkdir -p "$RO/g/s" "$RO/h" "$REM/g/s" "$REM/h" "$REM/.l2s"
+    printf 'hello\n' > "$RO/g/a"; ln "$RO/g/a" "$RO/g/b"; ln "$RO/g/a" "$RO/g/s/c"
+    printf 'hello\n' > "$REM/.l2s/.l2s.a0001.0003"
+    ln -s "$P/.l2s/.l2s.a0001.0003" "$REM/.l2s/.l2s.a0001"
+    for _n in a b s/c; do ln -s "$P/.l2s/.l2s.a0001" "$REM/g/$_n"; done
+    cp "$M10_ALPINE/bin/busybox" "$RO/g/echo"; ln "$RO/g/echo" "$RO/g/true"
+    cp "$M10_ALPINE/bin/busybox" "$REM/.l2s/.l2s.echo0001.0002"
+    ln -s "$P/.l2s/.l2s.echo0001.0002" "$REM/.l2s/.l2s.echo0001"
+    for _n in echo true; do ln -s "$P/.l2s/.l2s.echo0001" "$REM/g/$_n"; done
+    _old=/nonexistent/old-rootfs/.l2s
+    printf 'moved\n' > "$RO/g/m1"; ln "$RO/g/m1" "$RO/g/m2"
+    printf 'moved\n' > "$REM/.l2s/.l2s.m10001.0002"
+    ln -s "$_old/.l2s.m10001.0002" "$REM/.l2s/.l2s.m10001"
+    for _n in m1 m2; do ln -s "$_old/.l2s.m10001" "$REM/g/$_n"; done
+    printf 'beside\n' > "$RO/h/p"; ln "$RO/h/p" "$RO/g/q"
+    printf 'beside\n' > "$REM/h/.l2s.p0001.0002"
+    ln -s "$P/h/.l2s.p0001.0002" "$REM/h/.l2s.p0001"
+    ln -s "$P/h/.l2s.p0001" "$REM/h/p"; ln -s "$P/h/.l2s.p0001" "$REM/g/q"
+    s='cd /g; stat -c "%h %F %s" a b s/c;
+       [ "$(stat -c %i a)" = "$(stat -c %i s/c)" ] && echo same-ino;
+       cat s/c; readlink b; echo rl=$?; ls -a . s; find . -type f | sort;
+       ln b d; stat -c %h a d; rm a; stat -c %h b d s/c; mv b s/c; echo mv=$?;
+       stat -c %h b s/c d; echo new > n; mv n d; stat -c %h b s/c d; cat d b;
+       ./echo via-member; stat -c %h echo true;
+       stat -c %h m1 m2; cat m2; ln m1 m3; rm m1; stat -c %h m2 m3;
+       stat -c %h q /h/p; cat q; rm /h/p q; ls -a /h; rm b s/c; ls -a . s'
+    out_o=$("$M10_ORACLE" "$RO" /bin/sh -c "$s" 2>/dev/null); rc_o=$?
+    out_e=$(run -R -l "$REM" /bin/sh -c "$s" 2>/dev/null); rc_e=$?
+    if [ "$out_o" = "$out_e" ] && [ "$rc_o" = "$rc_e" ]; then
+        pass=$((pass + 1)); echo "  ok   m10 proot-distro's groups read as hardlinks"
+    else
+        fail=$((fail + 1)); echo "  FAIL m10 proot-distro's groups read as hardlinks"
+        echo "    oracle rc=$rc_o: $(printf %s "$out_o" | head -c 600)"
+        echo "    chroot rc=$rc_e: $(printf %s "$out_e" | head -c 600)"
+    fi
+    left=$(cd "$REM" && ls -A .l2s | grep -v '^\.lock$' | tr '\n' ' ';
+        readlink .l2s/.l2s.echo0001 .l2s/.l2s.m10001 g/echo g/m2 g/m3 |
+            sed "s|^$P|P|" | tr '\n' ' '; ls -A h | tr '\n' ' ')
+    check "m10 ...and proot's bookkeeping is what proot would leave" \
+        ".l2s.echo0001 .l2s.echo0001.0002 .l2s.m10001 .l2s.m10001.0002 P/.l2s/.l2s.echo0001.0002 P/.l2s/.l2s.m10001.0002 P/.l2s/.l2s.echo0001 P/.l2s/.l2s.m10001 P/.l2s/.l2s.m10001 " \
+        "$left"
+    rm -rf "$RO" "$REM"
+fi
+
 # The dirents themselves. Every leg above goes through busybox, which stats
 # each entry it lists, so a record that lies about a link — the kernel's is the
 # symlink's own: DT_LNK, the link's inode — never showed. GNU ls -F, find
@@ -237,10 +321,55 @@ if guest_xlate_ready "l2s first-link race leg" &&
     rm -rf "$R"
 fi
 
+# A link and an unlink from a signal handler that interrupted another. Every
+# count change holds the store lock (an flock) across several syscalls, and on
+# the -R tier the dispatcher runs on the guest's own signal mask: a handler
+# delivered inside one that linked or unlinked a name itself waited for the
+# lock its own thread held, forever. The timer's delay is swept across the time
+# one link+unlink takes; with real hardlinks every call succeeds and the group
+# ends with its two names, so no oracle is needed. A hang is the bug.
+if guest_xlate_ready "l2s link from a signal handler leg" &&
+    guest_cc_report "$CNG_TMP/l2ssig" tests/guests/l2ssig.c; then
+    R=$(mktemp -d)
+    mkdir -p "$R/bin" "$R/w"
+    cp "$CNG_TMP/l2ssig" "$R/bin/l2ssig"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 120 $GUEST_BINDS -R -l "$R" /bin/l2ssig /w 2>/dev/null)
+    check_contains "m10 a link from a handler that interrupted another" \
+        "l2ssig: handled>0=1 bad=0 nlink=2" "$out"
+    rm -rf "$R"
+fi
+
+# A fork by another thread while one links. The lock is an flock, which belongs
+# to the open file: a child forked while it was held kept a duplicate of that
+# file, and the close that gave the lock back left it held until the child
+# exec'd or exited, so the next change of any group waited out the child.
+# Children that wait without exec'ing are forked under a loop of links; with
+# real hardlinks no pair is held up.
+if guest_xlate_ready "l2s link beside a fork leg" &&
+    guest_cc_report "$CNG_TMP/l2sfork" tests/guests/l2sfork.c -pthread; then
+    R=$(mktemp -d)
+    mkdir -p "$R/bin" "$R/w"
+    cp "$CNG_TMP/l2sfork" "$R/bin/l2sfork"
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 120 $GUEST_BINDS -R -l "$R" /bin/l2sfork /w 2>/dev/null)
+    check_contains "m10 a fork while the lock is held does not keep it" \
+        "l2sfork: stalled=0 bad=0" "$out"
+    rm -rf "$R"
+fi
+
 # Debian leg: glibc + GNU coreutils/findutils (`find -samefile`, GNU stat).
 # Gated on a smoke test proving translation is live — a dynamic-glibc guest
 # under -R + qemu can silently run untranslated (ld.so-loaded libc.so has no
 # rewritten svc sites), which would read the HOST's /etc, not the guest's.
+# The image is provisioned here and nowhere else: nothing but this leg uses
+# it, and the leg needs the oracle too, which most hosts lack.
+m10_deb_why=
+if [ "$m10_ready" -eq 1 ] && [ -z "$M10_DEBIAN" ]; then
+    cng_rootfs debian fetch
+    M10_DEBIAN=$CNG_ROOTFS
+    m10_deb_why=$CNG_ROOTFS_WHY
+fi
 if [ "$m10_ready" -eq 1 ] && [ -n "$M10_DEBIAN" ] && [ -x "$M10_DEBIAN/bin/ls" ]; then
     RD=$(mktemp -d)
     cp -a "$M10_DEBIAN/." "$RD"
@@ -269,7 +398,7 @@ if [ "$m10_ready" -eq 1 ] && [ -n "$M10_DEBIAN" ] && [ -x "$M10_DEBIAN/bin/ls" ]
     esac
     rm -rf "$RD"
 elif [ "$m10_ready" -eq 1 ]; then
-    skip "debian leg: no debian rootfs"
+    skip "debian leg: no debian rootfs${m10_deb_why:+ ($m10_deb_why)}"
 fi
 
 unset CNG_L2S_FORCE

@@ -3,6 +3,7 @@
 /* Synthesized /proc files (see include/cng/procfs.h). Freestanding: raw
  * syscalls, cng_dprintf for formatting, no allocator. Every entry point runs
  * inside the SIGSYS handler, so nothing here may block on a lock. */
+#include "cng/loader.h"
 #include "cng/monitor.h"
 #include "cng/path.h"
 #include "cng/pin.h"
@@ -15,6 +16,7 @@
 /* aarch64 struct stat / statfs field offsets (stable syscall ABI). */
 #define STAT_DEV_OFF   0
 #define STAT_INO_OFF   8
+#define STAT_NLINK_OFF 20
 #define STATFS_TYPE_OFF 0
 
 /* Which file a synthesized fd holds. */
@@ -559,53 +561,60 @@ static void put_stat(int fd) {
  * the Uid: line, which otherwise carries our real host uid). Returns 0, or -1 if
  * the host file cannot be read (caller falls back to passthrough).
  *
- * `self` picks where that identity comes from. For this process it is the live
- * set in cng_g_cred — the one every credential syscall reads and writes, and the
- * one getresuid/getresgid/getgroups answer from. Remapping the host's numbers
- * instead described the identity the process STARTED with: a guest that dropped
- * privilege was still Uid: 0 here while `id` said otherwise, and its Groups:
- * line was the invoking user's supplementary groups, which getgroups() has never
- * reported (the synthetic set starts empty). One process cannot have two
- * answers; the kernel reads both out of the same struct cred.
+ * For this process that identity is the live set in cng_g_cred — the one every
+ * credential syscall reads and writes, and the one getresuid/getresgid/
+ * getgroups answer from. Remapping the host's numbers instead described the
+ * identity the process STARTED with: a guest that dropped privilege was still
+ * Uid: 0 here while `id` said otherwise, and its Groups: line was the invoking
+ * user's supplementary groups, which getgroups() has never reported (the
+ * synthetic set starts empty). One process cannot have two answers; the kernel
+ * reads both out of the same struct cred.
  *
- * Another guest process is a different matter: its set is its own copy, forked
- * for real and changed since, and nothing publishes it. There the host line
- * remapped is the closest thing available — that process's startup identity,
- * which is right until it changes its own credentials. */
-static int put_status(int fd, const char *host, int self) {
+ * Another guest process's set is its own copy, forked for real and changed
+ * since, and it publishes that copy (procreg.h), the ids and the groups as one
+ * read. A shell after `su - user` was listed as root, the identity the run
+ * began as, because the host's line was all there was to remap. Where nothing
+ * is published — the registry is unavailable or full, or the process is
+ * another invocation's — the host line remapped is still the closest thing:
+ * that process's startup identity. */
+static int put_status(int fd, const char *host, int pid) {
     long hf = open_host_ro(host);
     if (hf < 0)
         return -1;
+    struct cng_procids p;
+    u32 groups[CNG_PROCREG_GROUPS], ng = 0;
+    int known;
+    if (pid == (int)sys_getpid()) {
+        struct cng_cred_ids id;
+        ng = (u32)cng_cred_groups(groups, &id);
+        p.ruid = id.ruid, p.euid = id.euid, p.suid = id.suid;
+        p.fsuid = id.fsuid, p.rgid = id.rgid, p.egid = id.egid;
+        p.sgid = id.sgid, p.fsgid = id.fsgid;
+        known = 1;
+    } else {
+        known = cng_procreg_cred(pid, &p, groups, &ng) && p.fake;
+    }
     struct lrd r; /* 8.5 KiB — the dispatcher runs on its own 256 KiB stack */
     lrd_init(&r, (int)hf);
     const char *line;
     while ((line = lrd_next(&r)) != 0) {
         int is_uid = !strncmp(line, "Uid:", 4);
         if (is_uid || !strncmp(line, "Gid:", 4)) {
-            if (self) {
-                const struct cng_cred *c;
-                unsigned id[4];
-                do {
-                    unsigned s = cng_cred_read_begin(&c);
-                    id[0] = is_uid ? c->ruid : c->rgid;
-                    id[1] = is_uid ? c->euid : c->egid;
-                    id[2] = is_uid ? c->suid : c->sgid;
-                    id[3] = is_uid ? c->fsuid : c->fsgid;
-                    if (!cng_cred_read_retry(s))
-                        break;
-                } while (1);
-                cng_dprintf(fd, "%s\t%u\t%u\t%u\t%u\n", is_uid ? "Uid:" : "Gid:",
-                            id[0], id[1], id[2], id[3]);
+            if (known) {
+                cng_dprintf(fd, "%s\t%u\t%u\t%u\t%u\n",
+                            is_uid ? "Uid:" : "Gid:", is_uid ? p.ruid : p.rgid,
+                            is_uid ? p.euid : p.egid, is_uid ? p.suid : p.sgid,
+                            is_uid ? p.fsuid : p.fsgid);
                 continue;
             }
-            const char *p = line + 4;
+            const char *q = line + 4;
             unsigned id[4];
             int got = 0;
             while (got < 4) {
-                skip_ws(&p);
-                if (*p < '0' || *p > '9')
+                skip_ws(&q);
+                if (*q < '0' || *q > '9')
                     break;
-                id[got++] = (unsigned)parse_ul(&p);
+                id[got++] = (unsigned)parse_ul(&q);
             }
             if (got == 4) {
                 for (int i = 0; i < 4; i++)
@@ -622,29 +631,16 @@ static int put_status(int fd, const char *host, int self) {
              * used to print a leading space and no tab, so the line did not read
              * like the one every other status file has. Measured on the host. */
             cng_dprintf(fd, "Groups:\t");
-            if (self) {
-                /* The count and the list as one thing: a setgroups on another
-                 * thread publishes a whole new set, never edits this one. */
-                unsigned got[CNG_NGROUPS_MAX];
-                int n;
-                const struct cng_cred *c;
-                do {
-                    unsigned s = cng_cred_read_begin(&c);
-                    n = c->ngroups;
-                    for (int i = 0; i < n; i++)
-                        got[i] = c->groups[i];
-                    if (!cng_cred_read_retry(s))
-                        break;
-                } while (1);
-                for (int i = 0; i < n; i++)
-                    cng_dprintf(fd, "%u ", got[i]);
+            if (known) {
+                for (u32 i = 0; i < ng; i++)
+                    cng_dprintf(fd, "%u ", groups[i]);
             } else {
-                const char *p = line + 7;
+                const char *q = line + 7;
                 for (;;) {
-                    skip_ws(&p);
-                    if (*p < '0' || *p > '9')
+                    skip_ws(&q);
+                    if (*q < '0' || *q > '9')
                         break;
-                    cng_dprintf(fd, "%u ", cng_remap_gid((unsigned)parse_ul(&p)));
+                    cng_dprintf(fd, "%u ", cng_remap_gid((unsigned)parse_ul(&q)));
                 }
             }
             cng_dprintf(fd, "\n");
@@ -729,7 +725,36 @@ static int put_maps(int fd, const char *host) {
  * is per filesystem — a guest file with the memfd's number, moved onto the
  * memfd's old descriptor number, passed as the memfd and was truncated and
  * rewritten with /proc/stat, through a description of our own opened for
- * writing on a file the guest may only have been able to read. */
+ * writing on a file the guest may only have been able to read.
+ *
+ * Where a view is a file of ours instead (store_view), the pair is not enough:
+ * a memfd's inode number comes from a counter that only goes up, but ext4
+ * hands a freed inode number to the very next file it makes, so a /proc/uptime
+ * opened onto the number a closed /proc/loadavg had came back as the same
+ * device and inode, and was rewritten as loadavg. Each such file is named with
+ * a pid and counter of its own (see store_view), and that pair is the third
+ * part of the identity: the tag, 0 for a memfd and anything not ours. */
+struct pf_id {
+    unsigned long dev, ino, tag;
+};
+static unsigned long store_tag(int fd, unsigned long dev);
+
+static int pf_id_of(int fd, struct pf_id *id) {
+    struct cng_fdid f;
+    if (cng_fdid_of(fd, &f) != 0)
+        return -1;
+    id->dev = f.dev;
+    id->ino = f.ino;
+    id->tag = store_tag(fd, f.dev);
+    return 0;
+}
+
+static int pf_is(int fd, const struct pf_id *id) {
+    struct pf_id cur;
+    return pf_id_of(fd, &cur) == 0 && cur.dev == id->dev &&
+           cur.ino == id->ino && cur.tag == id->tag;
+}
+
 /*
  * An entry is three facts about one descriptor — its number, the kind of file
  * it regenerates as, and the identity that proves the number still names it —
@@ -755,13 +780,13 @@ static struct {
     unsigned seq; /* even: settled; odd: being rewritten by its claimant */
     int fd1;      /* fd + 1, so a zeroed table means "all free" */
     int kind;
-    struct cng_fdid id;
+    struct pf_id id;
 } g_pf[CNG_SYNTH_FD_SLOTS];
 
 /* A settled copy of entry i, and the sequence it was taken at; 0 while a
  * claimant is rewriting it. */
 static int pf_snap(int i, unsigned *seq, int *fd1, int *kind,
-                   struct cng_fdid *id) {
+                   struct pf_id *id) {
     unsigned s = __atomic_load_n(&g_pf[i].seq, __ATOMIC_ACQUIRE);
     if (s & 1)
         return 0;
@@ -769,6 +794,7 @@ static int pf_snap(int i, unsigned *seq, int *fd1, int *kind,
     *kind = __atomic_load_n(&g_pf[i].kind, __ATOMIC_RELAXED);
     id->dev = __atomic_load_n(&g_pf[i].id.dev, __ATOMIC_RELAXED);
     id->ino = __atomic_load_n(&g_pf[i].id.ino, __ATOMIC_RELAXED);
+    id->tag = __atomic_load_n(&g_pf[i].id.tag, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     if (__atomic_load_n(&g_pf[i].seq, __ATOMIC_RELAXED) != s)
         return 0;
@@ -790,17 +816,18 @@ static int pf_claim(int i, unsigned seq) {
 
 /* Settle a claimed entry: its facts, then the sequence that publishes them. */
 static void pf_settle(int i, unsigned seq, int fd1, int kind,
-                      const struct cng_fdid *id) {
+                      const struct pf_id *id) {
     __atomic_store_n(&g_pf[i].fd1, fd1, __ATOMIC_RELAXED);
     __atomic_store_n(&g_pf[i].kind, kind, __ATOMIC_RELAXED);
     __atomic_store_n(&g_pf[i].id.dev, id->dev, __ATOMIC_RELAXED);
     __atomic_store_n(&g_pf[i].id.ino, id->ino, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pf[i].id.tag, id->tag, __ATOMIC_RELAXED);
     __atomic_store_n(&g_pf[i].seq, seq + 2, __ATOMIC_RELEASE);
 }
 
 static void pf_track(int fd, int kind) {
-    struct cng_fdid nid;
-    if (cng_fdid_of(fd, &nid) != 0)
+    struct pf_id nid;
+    if (pf_id_of(fd, &nid) != 0)
         return;
     /* The entry this very number had, first: it described the file the
      * number named before this one, so it is stale by the new file's
@@ -814,15 +841,15 @@ static void pf_track(int fd, int kind) {
         for (int i = 0; i < CNG_SYNTH_FD_SLOTS; i++) {
             unsigned s;
             int f1, k;
-            struct cng_fdid id;
+            struct pf_id id;
             if (!pf_snap(i, &s, &f1, &k, &id))
                 continue;
             int take = pass == 0   ? f1 == fd + 1
                        : pass == 1 ? f1 == 0
-                                   : f1 > 0 && !cng_fd_is(f1 - 1, &id);
+                                   : f1 > 0 && !pf_is(f1 - 1, &id);
             if (!take || !pf_claim(i, s))
                 continue;
-            if (f1 > 0 && cng_fd_is(f1 - 1, &id)) {
+            if (f1 > 0 && pf_is(f1 - 1, &id)) {
                 pf_settle(i, s, f1, k, &id);
                 continue;
             }
@@ -845,7 +872,7 @@ static long synth_reopen(int fd, long oflags) {
     return sys_openat(CNG_AT_FDCWD, link, oflags | CNG_O_CLOEXEC, 0);
 }
 
-static void regen(int fd, int kind, const struct cng_fdid *id) {
+static void regen(int fd, int kind, const struct pf_id *id) {
     /* The guest holds a read-only description, so the rewrite goes through a
      * writable one taken for the call. Where that cannot be had, the fd itself
      * is tried: it is writable exactly when the seal below could not be
@@ -855,14 +882,32 @@ static void regen(int fd, int kind, const struct cng_fdid *id) {
      * number is at that moment — the caller checked it a syscall ago, and the
      * number is in the guest's table. So what came back is checked against
      * the memfd's identity before a byte of it is truncated: a description
-     * of something else is closed and left as it was. */
+     * of something else is closed and left as it was.
+     *
+     * Two threads reading the file at once both rewrite it, each with the
+     * clock it read, and the later write wins whichever clock is older: a
+     * rewrite held up between its clock and its write — on f2fs, behind the
+     * inode lock of the other's — put an older uptime back over a newer one,
+     * and the rewind that asked for the newer read the very bytes it had
+     * read before. So a rewrite through a description of ours holds that
+     * description's flock across the clock and the write, and the next one
+     * waits for it. Never blocking: a guest may flock its own description of
+     * the same file, and a fork mid-rewrite leaves the child holding ours, so
+     * after a bounded wait the rewrite goes ahead unlocked. Through the
+     * guest's own description nothing is locked — that lock is the guest's. */
     long w = synth_reopen(fd, CNG_O_RDWR);
-    if (w >= 0 && !cng_fd_is((int)w, id)) {
+    if (w >= 0 && !pf_is((int)w, id)) {
         sys_close((int)w);
         return;
     }
+    for (int t = 0; w >= 0 && t < 256; t++) {
+        if (CNG_SYS(__NR_flock, w, 2 /* LOCK_EX */ | 4 /* LOCK_NB */, 0, 0, 0,
+                    0) != -EWOULDBLOCK)
+            break;
+        CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    }
     int wfd = w >= 0 ? (int)w : fd;
-    if ((w >= 0 || cng_fd_is(fd, id)) && sys_ftruncate(wfd, 0) == 0) {
+    if ((w >= 0 || pf_is(fd, id)) && sys_ftruncate(wfd, 0) == 0) {
         sys_lseek(wfd, 0, CNG_SEEK_SET);
         switch (kind) {
         case PF_LOADAVG:
@@ -888,17 +933,17 @@ void cng_procfs_pre_read(int fd, long off) {
     for (int i = 0; i < CNG_SYNTH_FD_SLOTS; i++) {
         unsigned s;
         int f1, kind;
-        struct cng_fdid id;
+        struct pf_id id;
         if (!pf_snap(i, &s, &f1, &kind, &id) || f1 != fd + 1)
             continue;
-        if (!cng_fd_is(fd, &id)) {
+        if (!pf_is(fd, &id)) {
             /* Stale: the fd was reused. Retired only as it was judged — an
              * entry another thread has made here since is not this one —
              * and the scan goes on, for the entry the number's current
              * file may have. */
             if (pf_claim(i, s)) {
-                struct cng_fdid none = {0, 0};
-                if (cng_fd_is(fd, &id)) /* put back meanwhile (see pf_track) */
+                struct pf_id none = {0, 0, 0};
+                if (pf_is(fd, &id)) /* put back meanwhile (see pf_track) */
                     pf_settle(i, s, f1, kind, &id);
                 else
                     pf_settle(i, s, 0, 0, &none);
@@ -971,21 +1016,223 @@ static long synth_memfd(int refreshable, const char *name) {
     (CNG_O_APPEND | CNG_O_NONBLOCK | CNG_O_DSYNC | CNG___O_SYNC |              \
      CNG_O_NOATIME | CNG_O_NOCTTY | CNG_O_LARGEFILE)
 
+/* ---- read-only views where a memfd cannot be reopened -------------------
+ *
+ * The one way to a read-only description of a memfd is a reopen through its
+ * own /proc link, and Android's policy refuses an app the `open` of the tmpfs
+ * inode behind one. The view then stayed the O_RDWR memfd memfd_create made —
+ * which Chrome refuses: it dup()s the /proc/<pid>/status of each child it
+ * starts and CHECKs that the file it hands on is read-only. So there the view
+ * is copied into a file of ours instead, in a private directory under the temp
+ * directory (cng_private_tmp_dir), opened O_RDONLY for real, and unlinked
+ * before the guest sees it: a file on /data is one an app may open, and
+ * reopen through its link as the refresh does.
+ *
+ * The file carries the view's name as the memfd does, for the same reason:
+ * the name is what every route to the description keeps, and the link reads
+ * "<dir>/cng-proc.<pid>.<n>:<name> (deleted)", '/' and '%' escaped. The pid
+ * and counter only keep two views of one file apart while both are being
+ * made. A process killed between the create and the unlink leaves its file
+ * behind in that directory, a few hundred bytes nothing reads.
+ *
+ * Settled once per process, and only where the memfd reopen is refused: a
+ * host that grants it never makes the directory. */
+#define STORE_STEM     "chroot-ng-proc.v1"
+#define STORE_HEAD     "cng-proc."
+#define STORE_HEAD_LEN 9
+#define STORE_LEAF_MAX 255 /* NAME_MAX: the leaf is one path component */
+static char g_store[CNG_PATH_MAX];
+static unsigned long g_store_dev;
+static long g_store_fstype;
+static unsigned g_store_seq;
+static int g_store_state; /* 0 unasked, 1 in use, -1 not used here */
+int cng_g_procfs_reopen_deny = 0;
+
+static int store_on(void) {
+    int v = __atomic_load_n(&g_store_state, __ATOMIC_ACQUIRE);
+    if (v)
+        return v;
+    v = -1;
+    long mfd = sys_memfd_create("cng-probe", CNG_MFD_CLOEXEC);
+    if (mfd >= 0) {
+        long ro = cng_g_procfs_reopen_deny ? -EACCES
+                                           : synth_reopen((int)mfd, CNG_O_RDONLY);
+        char st[128];
+        long sf[16];
+        if (ro >= 0)
+            sys_close((int)ro);
+        else if (cng_private_tmp_dir(STORE_STEM, g_store, sizeof g_store, 0,
+                                     0) == 0 &&
+                 CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, g_store, st, 0, 0, 0) ==
+                     0 &&
+                 CNG_SYS(__NR_statfs, g_store, sf, 0, 0, 0, 0) == 0) {
+            g_store_dev = *(unsigned long *)(st + STAT_DEV_OFF);
+            g_store_fstype = *(long *)((char *)sf + STATFS_TYPE_OFF);
+            v = 1;
+        }
+        sys_close((int)mfd);
+    }
+    __atomic_store_n(&g_store_state, v, __ATOMIC_RELEASE);
+    return v;
+}
+
+/* A /proc name as one path component: '%' and '/' as %25 and %2F. 0, or -1
+ * when it does not fit. */
+static int store_encode(const char *name, char *out, size_t sz) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t k = 0;
+    for (const char *p = name; *p; p++) {
+        if (*p == '%' || *p == '/') {
+            if (k + 3 >= sz)
+                return -1;
+            out[k++] = '%';
+            out[k++] = hex[(unsigned char)*p >> 4];
+            out[k++] = hex[*p & 15];
+        } else {
+            if (k + 1 >= sz)
+                return -1;
+            out[k++] = *p;
+        }
+    }
+    out[k] = '\0';
+    return 0;
+}
+
+/* The /proc name in `n` bytes of an encoded component. 1, or 0 for anything
+ * store_encode did not write. */
+static int store_decode(const char *in, size_t n, char *out, size_t sz) {
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = in[i];
+        if (c == '/')
+            return 0;
+        if (c == '%') {
+            if (i + 2 >= n)
+                return 0;
+            if (!strncmp(in + i, "%2F", 3))
+                c = '/';
+            else if (!strncmp(in + i, "%25", 3))
+                c = '%';
+            else
+                return 0;
+            i += 2;
+        }
+        if (k + 1 >= sz)
+            return 0;
+        out[k++] = c;
+    }
+    out[k] = '\0';
+    return k > 0;
+}
+
+/* A read-only description of the view in `fd`, through a file of ours named
+ * after it; -1 where the store is not in use or the file cannot be made. */
+static long store_view(int fd, const char *name, long gflags) {
+    if (store_on() <= 0)
+        return -1;
+    char enc[STORE_LEAF_MAX + 1];
+    if (store_encode(name, enc, sizeof enc) != 0)
+        return -1;
+    char leaf[STORE_LEAF_MAX + 64], path[CNG_PATH_MAX];
+    unsigned seq = __atomic_fetch_add(&g_store_seq, 1, __ATOMIC_RELAXED);
+    size_t ll = cng_snprintf(leaf, sizeof leaf, STORE_HEAD "%ld.%u:%s",
+                             sys_getpid(), seq, enc);
+    if (ll > STORE_LEAF_MAX ||
+        cng_snprintf(path, sizeof path, "%s/%s", g_store, leaf) >= sizeof path)
+        return -1;
+    long w = sys_openat(CNG_AT_FDCWD, path,
+                        CNG_O_RDWR | CNG_O_CREAT | CNG_O_EXCL | CNG_O_NOFOLLOW |
+                            CNG_O_CLOEXEC,
+                        0600);
+    if (w < 0)
+        return -1;
+    char buf[4096];
+    long off = 0, n;
+    int ok = 1;
+    while (ok && (n = sys_pread64(fd, buf, sizeof buf, off)) != 0) {
+        if (n == -EINTR)
+            continue;
+        ok = n > 0 && cng_write_all((int)w, buf, (size_t)n) == n;
+        off += n;
+    }
+    long ro = ok ? sys_openat(CNG_AT_FDCWD, path,
+                              CNG_O_RDONLY | CNG_O_NOFOLLOW | CNG_O_CLOEXEC |
+                                  (gflags & SYNTH_STATUS_FLAGS),
+                              0)
+                 : -1;
+    CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, path, 0, 0, 0, 0);
+    sys_close((int)w);
+    return ro;
+}
+
+/* The /proc name behind a store file's link text, as cng_procfs_link_name
+ * gives a memfd's. */
+static int store_link_name(const char *tgt, char *out, size_t sz) {
+    if (store_on() <= 0)
+        return 0;
+    size_t dl = strlen(g_store), n = strlen(tgt);
+    if (strncmp(tgt, g_store, dl) || tgt[dl] != '/' ||
+        strncmp(tgt + dl + 1, STORE_HEAD, STORE_HEAD_LEN) ||
+        n < dl + 1 + STORE_HEAD_LEN + SYNTH_LINK_TAIL_LEN ||
+        strcmp(tgt + n - SYNTH_LINK_TAIL_LEN, SYNTH_LINK_TAIL))
+        return 0;
+    const char *leaf = tgt + dl + 1 + STORE_HEAD_LEN;
+    const char *end = tgt + n - SYNTH_LINK_TAIL_LEN;
+    const char *c = leaf;
+    while (c < end && *c != ':')
+        c++;
+    if (c >= end)
+        return 0;
+    return store_decode(c + 1, (size_t)(end - c - 1), out, sz);
+}
+
+/* The tag of a file of ours (struct pf_id): the pid and counter its name
+ * carries, read back from the fd's link. Asked only of a file on the store's
+ * device, where ours are; 0 for every other. */
+static unsigned long store_tag(int fd, unsigned long dev) {
+    if (dev != g_store_dev || store_on() <= 0)
+        return 0;
+    char link[40], tgt[CNG_PATH_MAX];
+    cng_snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+    long n = sys_readlinkat(CNG_AT_FDCWD, link, tgt, sizeof tgt - 1);
+    size_t dl = strlen(g_store);
+    if (n <= 0 || (size_t)n <= dl + 1 + STORE_HEAD_LEN)
+        return 0;
+    tgt[n] = '\0';
+    if (strncmp(tgt, g_store, dl) || tgt[dl] != '/' ||
+        strncmp(tgt + dl + 1, STORE_HEAD, STORE_HEAD_LEN))
+        return 0;
+    unsigned long pid = 0, seq = 0;
+    const char *p = tgt + dl + 1 + STORE_HEAD_LEN;
+    for (; *p >= '0' && *p <= '9'; p++)
+        pid = pid * 10 + (unsigned long)(*p - '0');
+    if (*p++ != '.')
+        return 0;
+    for (; *p >= '0' && *p <= '9'; p++)
+        seq = seq * 10 + (unsigned long)(*p - '0');
+    return *p == ':' ? (pid << 32 | (seq & 0xffffffffUL)) + 1 : 0;
+}
+
 /* Turn the writable memfd holding a finished view into what the guest opened:
  * a read-only description, with the status flags it asked for. The memfd is
- * reopened through its own /proc link with O_RDONLY and the new description is
+ * reopened through its own /proc link with O_RDONLY — or, where the host
+ * refuses that, a file of ours is (see above) — and the new description is
  * dup3'd over the same fd number, so the number the guest gets is still the
- * lowest that was free (or the reserved slot) and the inode the refresh
- * bookkeeping recorded is unchanged.
+ * lowest that was free (or the reserved slot). The refresh bookkeeping takes
+ * the inode after this.
  *
  * memfd_create only ever hands out O_RDWR, and that was what the guest got: a
  * /proc file it could write(), ftruncate(), mmap(MAP_SHARED|PROT_WRITE) and
  * see O_RDWR from F_GETFL on — every one of which the kernel refuses on the
- * real file (EBADF, EINVAL, EACCES, O_RDONLY; measured). Where the reopen is
- * refused the writable fd stands, as before: the content is right and only the
+ * real file (EBADF, EINVAL, EACCES, O_RDONLY; measured). Where neither route
+ * can be had the writable fd stands: the content is right and only the
  * description's mode is wrong. */
-static void synth_seal(int fd, long gflags) {
-    long ro = synth_reopen(fd, CNG_O_RDONLY | (gflags & SYNTH_STATUS_FLAGS));
+static void synth_seal(int fd, const char *name, long gflags) {
+    long ro = cng_g_procfs_reopen_deny
+                  ? -EACCES
+                  : synth_reopen(fd, CNG_O_RDONLY | (gflags & SYNTH_STATUS_FLAGS));
+    if (ro < 0)
+        ro = store_view(fd, name, gflags);
     if (ro < 0) {
         if (cng_g_debug)
             cng_dprintf(2, "[cng] procfs fd %d stays writable: reopen errno=%ld\n",
@@ -1073,11 +1320,25 @@ static int per_pid_kind(const char *leaf) {
     return 0;
 }
 
+/* "task/<tid>/status": a thread's status, whose ids are its process's (the
+ * fake set is process-wide). `ps -L` and `top -H` name a thread's user by it,
+ * the group leader's own task entry included. */
+static int task_status(const char *leaf) {
+    if (strncmp(leaf, "task/", 5) || leaf[5] < '1' || leaf[5] > '9')
+        return 0;
+    const char *q = leaf + 5;
+    while (*q >= '0' && *q <= '9')
+        q++;
+    return !strcmp(q, "/status");
+}
+
 /* The guest stack of the program running here, kept so our own cmdline/environ/
  * auxv can be answered from live state when the registry cannot answer (see
- * self_snapshot). Re-recorded at every emulated execve, which is where a real
- * kernel moves its own arg_start/env_start too. */
+ * self_snapshot), and where on it the loader put the argv and environment
+ * strings. Re-recorded at every emulated execve, which is where a real kernel
+ * moves its own arg_start/env_start too. */
 static unsigned long g_self_sp;
+static struct cng_procargs g_self_args;
 
 /* Flatten a NUL-terminated vector into NUL-joined bytes, the way the kernel
  * stores cmdline and environ. Nothing here is dereferenced unchecked: this reads
@@ -1087,8 +1348,9 @@ static unsigned long g_self_sp;
  * the slot and the string it names are taken with the copy-in pair, so the
  * bytes that are measured are the bytes that are stored; a strlen followed by a
  * memcpy reads the same string twice, and between the two reads it can change.
- * Whatever will not come across ends the vector where it stands, which is also
- * what the kernel shows for a process rewriting its own argv. */
+ * Whatever will not come across ends the vector where it stands. These copies
+ * are the fallback for cmdline and environ: the stack's own string ranges, read
+ * as the kernel reads them (put_live), answer first wherever they are known. */
 static unsigned flatten_vec(char *dst, unsigned cap, char **v) {
     unsigned n = 0;
     long cnt = cng_user_veclen(v, 4096);
@@ -1126,6 +1388,7 @@ static int self_snapshot(struct cng_procsnap *out) {
      * probes now, and what will not come across shortens the answer instead of
      * ending the process. */
     memset(out, 0, sizeof *out);
+    out->args = g_self_args;
     long argc;
     if (cng_user_copyin(&argc, (void *)g_self_sp, sizeof argc) < 0)
         return 0;
@@ -1170,6 +1433,142 @@ static int self_snapshot(struct cng_procsnap *out) {
     return 1;
 }
 
+/* ---- cmdline and environ out of live memory ------------------------------ */
+
+/* The kernel reads both files out of the process's memory at read time, from
+ * the ranges its exec recorded — not through argv and envp, which are the
+ * program's to repoint — so whatever a program writes over its own strings is
+ * what they say from then on: setproctitle(3), node's process.title, the
+ * status lines nginx and postgres keep in argv. The registry's copies date from
+ * the exec, and served on their own they answered every `ps` with the command
+ * line the process started with. These read the ranges instead, under the
+ * kernel's rules, and leave the copies for when the memory cannot be read. */
+
+#define LIVE_CHUNK 4096u
+
+/* Up to `n` bytes of `pid`'s memory at `addr`, as many as read from the start —
+ * what access_remote_vm hands procfs. Our own come through the copy-in pair one
+ * 4 KiB piece at a time, so a hole ends the read where it starts instead of
+ * voiding all of it; another process's come in one process_vm_readv, which
+ * stops at a hole by itself. Returns the count, or -1 when another process's
+ * memory cannot be asked for at all: the call is filtered (the block-list says
+ * so), missing (qemu-user), or refused, as Yama's ptrace_scope 1 — the Ubuntu
+ * default — refuses it for any process that is not our descendant and the
+ * kernel does for one that made itself undumpable. A process that has exited
+ * holds no memory, which the kernel answers with an empty file: 0, not -1. */
+static long live_read(int pid, unsigned long addr, char *dst, unsigned long n) {
+    if (pid == (int)sys_getpid()) {
+        unsigned long got = 0;
+        while (got < n) {
+            unsigned long k = LIVE_CHUNK - ((addr + got) & (LIVE_CHUNK - 1));
+            if (k > n - got)
+                k = n - got;
+            if (cng_user_copyin(dst + got, (const void *)(addr + got), k) < 0)
+                break;
+            got += k;
+        }
+        return (long)got;
+    }
+    if (cng_blocked[__NR_process_vm_readv])
+        return -1;
+    struct cng_iovec local = {dst, n};
+    struct cng_iovec remote = {(void *)addr, n};
+    long r = CNG_SYS(__NR_process_vm_readv, pid, &local, 1, &remote, 1, 0);
+    if (r >= 0)
+        return r;
+    return r == -EFAULT || r == -ESRCH ? 0 : -1;
+}
+
+/* [from, to) of `pid`'s memory into `fd`, up to the first byte that will not
+ * read. 0, or -1 when not even the first piece could be asked for. */
+static int live_span(int fd, int pid, unsigned long from, unsigned long to,
+                     char *buf) {
+    for (unsigned long at = from; at < to;) {
+        unsigned long k = LIVE_CHUNK - (at & (LIVE_CHUNK - 1));
+        if (k > to - at)
+            k = to - at;
+        long got = live_read(pid, at, buf, k);
+        if (got < 0)
+            return at == from ? -1 : 0;
+        cng_write_all(fd, buf, (size_t)got);
+        if ((unsigned long)got < k)
+            break;
+        at += k;
+    }
+    return 0;
+}
+
+/* /proc/<pid>/cmdline as get_mm_cmdline() (fs/proc/base.c, 5.3+) makes it. The
+ * argv range as it stands, embedded NULs and all: a title written over
+ * argv[0] and padded with zeros, which is how libuv and nginx do it, reads back
+ * as the title and then the zeros. Unless the range's last byte is no longer a
+ * NUL — then the program has run a longer title past the end of argv into the
+ * environment, setproctitle(3)'s way, and the file is the string at arg_start
+ * up to its NUL: one page at most, never past env_end, and the overflow
+ * allowed only into an environment that starts where argv ends. Returns 0 when
+ * the file is written, -1 to fall back on the copy. */
+static int live_cmdline(int fd, int pid, const struct cng_procargs *a,
+                        char *buf) {
+    unsigned long as = a->arg_start, ae = a->arg_end;
+    unsigned long es = a->env_start, ee = a->env_end;
+    if (as >= ae)
+        return 0; /* argc 0: the kernel's file is empty */
+    if (es != ae || ee < es)
+        es = ee = ae;
+    char last;
+    long r = live_read(pid, ae - 1, &last, 1);
+    if (r < 0)
+        return -1;
+    if (r == 0 || !last)
+        return live_span(fd, pid, as, ae, buf);
+    unsigned long lim = ee - as;
+    if (lim > cng_page_size)
+        lim = cng_page_size;
+    for (unsigned long at = as; at < as + lim;) {
+        unsigned long k = LIVE_CHUNK - (at & (LIVE_CHUNK - 1));
+        if (k > as + lim - at)
+            k = as + lim - at;
+        long got = live_read(pid, at, buf, k);
+        if (got <= 0)
+            break;
+        long n = 0;
+        while (n < got && buf[n])
+            n++;
+        if (n < got) {
+            cng_write_all(fd, buf, (size_t)n + 1); /* the NUL is the file's */
+            break;
+        }
+        cng_write_all(fd, buf, (size_t)got);
+        if (got < (long)k)
+            break;
+        at += k;
+    }
+    return 0;
+}
+
+/* cmdline (PF_CMDLINE) or environ — environ_read()'s file is simply the
+ * environment range as it stands — out of `pid`'s memory. 0 when written, -1
+ * when the copies have to answer: the ranges are not known (a stack the loader
+ * did not lay out) or the memory cannot be asked for. */
+static int put_live(int fd, int pid, int kind, const struct cng_procargs *a) {
+    if (!a->arg_end)
+        return -1;
+    char buf[LIVE_CHUNK];
+    if (kind == PF_ENVIRON)
+        return live_span(fd, pid, a->env_start, a->env_end, buf);
+    return live_cmdline(fd, pid, a, buf);
+}
+
+/* Has `pid` pointed the kernel's own record at its strings (see
+ * point_kernel_record)? Then the host's cmdline and environ are the guest's,
+ * and nothing about them is ours to answer. */
+static int kernel_record(int pid) {
+    if (pid == (int)sys_getpid())
+        return g_self_args.kernel != 0;
+    struct cng_procargs a;
+    return cng_procreg_args(pid, &a) && a.kernel;
+}
+
 /* ---- the open hook ------------------------------------------------------- */
 
 /* What the canonical guest name `canon` is as far as synthesis goes: the PF_*
@@ -1197,6 +1596,8 @@ static int synth_kind(const char *canon, char *host, size_t hsz, int *pid,
     const char *leaf = pid_tail(canon, pid);
     if (leaf) {
         kind = per_pid_kind(leaf);
+        if (!kind && task_status(leaf) && strncmp(canon + 6, "thread-self/", 12))
+            kind = PF_STATUS;
         /* status only diverges under a fake identity; everything else about a
          * guest process's status is already true. */
         if (kind == PF_STATUS && !cng_g_fake_id)
@@ -1204,6 +1605,24 @@ static int synth_kind(const char *canon, char *host, size_t hsz, int *pid,
         /* Another process is describable only if it is a guest process; a host
          * one is already hidden by the path layer. */
         if (kind && !cng_procreg_has(*pid))
+            return 0;
+        /* Where the kernel's own record was pointed at the guest's strings, its
+         * cmdline and environ are the guest's — read at read time, under its
+         * own rules and permission checks — and nothing synthesized from the
+         * same memory could be closer to them.
+         *
+         * Except our own environ. The kernel binds an environ fd to the mm it
+         * was opened on, and a real execve leaves that mm behind, so an fd the
+         * process carries into its next program reads empty there (bash's
+         * `tr '\0' '\n' < /proc/self/environ`: the redirect is opened before
+         * the exec). Ours keeps the mm, and the host fd would follow the
+         * record into the next program's environment. A memfd filled at open
+         * keeps the opener's instead, which is what this has always answered.
+         * cmdline is bound to the task and read at read time, so after an
+         * exec the kernel's is the new program's, as the host file is. */
+        if ((kind == PF_CMDLINE ||
+             (kind == PF_ENVIRON && *pid != (int)sys_getpid())) &&
+            kernel_record(*pid))
             return 0;
     } else if (!strcmp(canon, "/proc/mounts")) {
         kind = PF_MOUNTS; /* where the /etc/mtab symlink usually lands */
@@ -1318,10 +1737,18 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
     int rc = 0;
     switch (kind) {
     case PF_CMDLINE:
-        cng_write_all((int)fd, snap.cmd, snap.cmd_len);
-        break;
     case PF_ENVIRON:
-        cng_write_all((int)fd, snap.env, snap.env_len);
+        if (put_live((int)fd, pid, kind, &snap.args) < 0) {
+            if (kind == PF_CMDLINE)
+                cng_write_all((int)fd, snap.cmd, snap.cmd_len);
+            else
+                cng_write_all((int)fd, snap.env, snap.env_len);
+        } else if (pid != (int)sys_getpid() && !cng_procreg_has(pid)) {
+            /* The pid was reaped and handed to a host process between the
+             * registry's check and the read: what came across may be that
+             * process's. A gone process's file is empty. */
+            sys_ftruncate((int)fd, 0);
+        }
         break;
     case PF_AUXV:
         cng_write_all((int)fd, snap.auxv, snap.auxv_len);
@@ -1351,7 +1778,7 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
         put_overflowid((int)fd);
         break;
     case PF_STATUS:
-        rc = put_status((int)fd, host, pid == (int)sys_getpid());
+        rc = put_status((int)fd, host, pid);
         break;
     case PF_MAPS:
         rc = put_maps((int)fd, host);
@@ -1362,7 +1789,7 @@ int cng_procfs_open(const char *canon, long gflags, long *ret) {
         return 0;
     }
 
-    synth_seal((int)fd, gflags); /* read-only from here, like the real file */
+    synth_seal((int)fd, link, gflags); /* read-only from here, like the real file */
     sys_lseek((int)fd, 0, CNG_SEEK_SET);
     if (!(gflags & CNG_O_CLOEXEC))
         sys_fcntl((int)fd, CNG_F_SETFD, 0); /* the guest did not ask for it */
@@ -1401,9 +1828,21 @@ static unsigned long memfd_dev(void) {
     return g_memfd_dev;
 }
 
+/* Could the file a stat describes be one of our views? The first cut, ahead
+ * of the link read that settles it: a memfd — whose device is the kernel's
+ * internal tmpfs, one for the whole system — or, where the views are files of
+ * ours (store_on), an unlinked file on the device their directory is on. The
+ * link count keeps every file of the rootfs, which may well be on that same
+ * device, from paying for a readlink on each stat. */
+static int synth_backed(unsigned long dev, unsigned nlink) {
+    if (memfd_dev() && dev == memfd_dev())
+        return 1;
+    return nlink == 0 && store_on() > 0 && dev == g_store_dev;
+}
+
 int cng_procfs_link_name(const char *tgt, char *out, size_t sz) {
     if (strncmp(tgt, SYNTH_LINK_HEAD, SYNTH_LINK_HEAD_LEN))
-        return 0;
+        return store_link_name(tgt, out, sz);
     size_t n = strlen(tgt);
     if (n < SYNTH_LINK_HEAD_LEN + 1 + SYNTH_LINK_TAIL_LEN ||
         strcmp(tgt + n - SYNTH_LINK_TAIL_LEN, SYNTH_LINK_TAIL))
@@ -1514,8 +1953,8 @@ static int synth_statx_gone(const char *name, unsigned long long ino,
 
 int cng_procfs_fix_fd(int fd, void *stat) {
     char *st = (char *)stat;
-    if (fd < 0 || *(unsigned long *)(st + STAT_DEV_OFF) != memfd_dev() ||
-        !memfd_dev())
+    if (fd < 0 || !synth_backed(*(unsigned long *)(st + STAT_DEV_OFF),
+                                ST_U32(st, STAT_NLINK_OFF)))
         return 0;
     char name[CNG_PATH_MAX];
     if (!synth_name_of(fd, name, sizeof name))
@@ -1529,7 +1968,8 @@ int cng_procfs_fix_fd(int fd, void *stat) {
 
 int cng_procfs_fix_path(long dirfd, const char *path, void *stat) {
     char *st = (char *)stat;
-    if (*(unsigned long *)(st + STAT_DEV_OFF) != memfd_dev() || !memfd_dev())
+    if (!synth_backed(*(unsigned long *)(st + STAT_DEV_OFF),
+                      ST_U32(st, STAT_NLINK_OFF)))
         return 0;
     char name[CNG_PATH_MAX];
     if (!synth_name_at(dirfd, path, name, sizeof name))
@@ -1551,7 +1991,10 @@ static unsigned long statx_dev(const char *sx) {
 
 static int fix_statx(long dirfd, const char *path, int fd, unsigned flags,
                      unsigned mask, char *sx) {
-    if (statx_dev(sx) != memfd_dev() || !memfd_dev())
+    /* stx_nlink is there only when stx_mask says so; without it, take the
+     * file for an unlinked one and let the link read decide. */
+    unsigned nlink = (ST_U32(sx, 0) & 0x4 /*STATX_NLINK*/) ? ST_U32(sx, 16) : 0;
+    if (!synth_backed(statx_dev(sx), nlink))
         return 0;
     char name[CNG_PATH_MAX];
     int ours = fd >= 0 ? synth_name_of(fd, name, sizeof name)
@@ -1581,6 +2024,127 @@ int cng_procfs_fix_fd_statx(int fd, unsigned flags, unsigned mask,
 int cng_procfs_fix_path_statx(long dirfd, const char *path, unsigned flags,
                               unsigned mask, void *statx) {
     return fix_statx(dirfd, path, -1, flags, mask, statx);
+}
+
+/* ---- the owner of a process's entries ------------------------------------ */
+
+/* task_dump_owner(): /proc/<pid> and everything under it belong to the
+ * process's effective uid and gid — root's, for the entries other than the
+ * world-readable directories, while the process is not dumpable. That is how
+ * `ps` names a process's user (procps and busybox stat /proc/<pid>; procps
+ * then reads the Uid: line of its status as well, put_status), and a guest's
+ * entries are the host's ids, which the remap every file gets made the
+ * identity the run began as: a shell after `su - user` was root's. So an
+ * entry the host gave the host's ids takes the ids its process publishes —
+ * ours from the live set — and one it gave anyone else is left as it was: a
+ * host process's, or one the kernel made root's because the process is not
+ * dumpable. Dumpability is the host's, which a change of fake ids does not
+ * touch: an entry of a process that set its ids and has not executed since is
+ * its new owner's here, where the kernel would give it to root. */
+
+/* The device of the procfs mount; settled once (the probe is idempotent). */
+static unsigned long proc_dev(int *ok) {
+    static unsigned long dev;
+    static int state; /* 0 not probed, 1 known, -1 unavailable */
+    int st = __atomic_load_n(&state, __ATOMIC_ACQUIRE);
+    if (!st) {
+        char sb[128]; /* struct stat */
+        st = CNG_SYS(__NR_newfstatat, CNG_AT_FDCWD, "/proc", sb, 0, 0, 0) == 0
+                 ? 1
+                 : -1;
+        if (st > 0)
+            dev = *(unsigned long *)(sb + STAT_DEV_OFF);
+        __atomic_store_n(&state, st, __ATOMIC_RELEASE);
+    }
+    *ok = st > 0;
+    return dev;
+}
+
+/* The pid of the process directory the host name at (dirfd, path) is in — or
+ * of fd `dirfd`, `path` being empty — or 0 for any other name. A relative
+ * name is read off the link of the directory it is relative to, and a memfd
+ * of ours (a synthesized file) by the name it stands for. A ".." is not
+ * walked: such a name keeps the remap. */
+static int owner_pid(long dirfd, const char *path) {
+    char name[CNG_PATH_MAX];
+    const char *n = path;
+    if (!path || path[0] != '/') {
+        char link[40], tgt[CNG_PATH_MAX];
+        if (dirfd == CNG_AT_FDCWD && path && path[0])
+            cng_strlcpy(link, "/proc/self/cwd", sizeof link);
+        else
+            cng_snprintf(link, sizeof link, "/proc/self/fd/%d", (int)dirfd);
+        long k = sys_readlinkat(CNG_AT_FDCWD, link, tgt, sizeof tgt - 1);
+        if (k <= 0)
+            return 0;
+        tgt[k] = '\0';
+        if (!cng_procfs_link_name(tgt, name, sizeof name))
+            cng_strlcpy(name, tgt, sizeof name);
+        if (path && path[0]) {
+            size_t l = strlen(name);
+            if (l + 1 + strlen(path) >= sizeof name)
+                return 0;
+            name[l] = '/';
+            cng_strlcpy(name + l + 1, path, sizeof name - l - 1);
+        }
+        n = name;
+    }
+    if (strncmp(n, "/proc/", 6))
+        return 0;
+    for (const char *q = n + 1; *q; q++) /* n[0] is the leading '/' */
+        if (q[0] == '.' && q[1] == '.' && q[-1] == '/' && (q[2] == '/' || !q[2]))
+            return 0;
+    n += 6;
+    if ((!strncmp(n, "self", 4) && (n[4] == '/' || !n[4])) ||
+        (!strncmp(n, "thread-self", 11) && (n[11] == '/' || !n[11])))
+        return (int)sys_getpid();
+    long pid = 0;
+    for (; *n >= '0' && *n <= '9'; n++)
+        if ((pid = pid * 10 + (*n - '0')) > 0x7fffffff)
+            return 0;
+    return pid > 0 && (*n == '/' || !*n) ? (int)pid : 0;
+}
+
+static int fix_owner(long dirfd, const char *path, unsigned long dev,
+                     unsigned *uid, unsigned *gid) {
+    int ok;
+    unsigned long pdev = proc_dev(&ok);
+    if (!cng_g_fake_id || !ok || dev != pdev ||
+        (*uid != cng_g_host_uid && *gid != cng_g_host_gid))
+        return 0;
+    int pid = owner_pid(dirfd, path);
+    if (pid <= 0)
+        return 0;
+    /* A thread's own directory, /proc/<tid>, is its process's. */
+    int tg = cng_procreg_has(pid) ? pid : cng_proc_tgid(pid);
+    unsigned eu, eg;
+    if (tg == (int)sys_getpid()) {
+        struct cng_cred_ids id;
+        cng_cred_ids(&id);
+        eu = id.euid, eg = id.egid;
+    } else {
+        struct cng_procids p;
+        if (tg <= 0 || !cng_procreg_ids(tg, &p) || !p.fake)
+            return 0;
+        eu = p.euid, eg = p.egid;
+    }
+    if (*uid == cng_g_host_uid)
+        *uid = eu;
+    if (*gid == cng_g_host_gid)
+        *gid = eg;
+    return 1;
+}
+
+int cng_procfs_owner(long dirfd, const char *path, void *stat) {
+    char *st = (char *)stat;
+    return fix_owner(dirfd, path, *(unsigned long *)(st + STAT_DEV_OFF),
+                     (unsigned *)(st + 24), (unsigned *)(st + 28));
+}
+
+int cng_procfs_owner_statx(long dirfd, const char *path, void *statx) {
+    char *sx = (char *)statx;
+    return fix_owner(dirfd, path, statx_dev(sx), (unsigned *)(sx + 20),
+                     (unsigned *)(sx + 24));
 }
 
 /* ---- a stat the host refused --------------------------------------------- */
@@ -1678,7 +2242,8 @@ int cng_procfs_synth_access(const char *canon, int mode, int follow) {
 int cng_procfs_fstatfs(int fd, void *buf) {
     char st[128];
     if (fd < 0 || sys_fstat(fd, st) != 0 ||
-        *(unsigned long *)(st + STAT_DEV_OFF) != memfd_dev() || !memfd_dev())
+        !synth_backed(*(unsigned long *)(st + STAT_DEV_OFF),
+                      ST_U32(st, STAT_NLINK_OFF)))
         return 0;
     char name[CNG_PATH_MAX];
     if (!synth_name_of(fd, name, sizeof name))
@@ -1691,8 +2256,10 @@ int cng_procfs_fstatfs(int fd, void *buf) {
 #define TMPFS_MAGIC 0x01021994L
 int cng_procfs_fix_path_statfs(long dirfd, const char *path, void *buf) {
     /* statfs names no inode, so the filesystem type is the first cut: only a
-     * name that landed on a tmpfs can have landed on a memfd. */
-    if (*(long *)((char *)buf + STATFS_TYPE_OFF) != TMPFS_MAGIC)
+     * name that landed on a tmpfs can have landed on a memfd, and only one on
+     * the store's filesystem on a file of ours. */
+    long type = *(long *)((char *)buf + STATFS_TYPE_OFF);
+    if (type != TMPFS_MAGIC && !(store_on() > 0 && type == g_store_fstype))
         return 0;
     char name[CNG_PATH_MAX];
     if (!synth_name_at(dirfd, path, name, sizeof name))
@@ -1743,10 +2310,118 @@ static void set_comm(const char *exe_guest) {
     sys_prctl(CNG_PR_SET_NAME, (unsigned long)nm, 0, 0, 0);
 }
 
+/* -1 not asked yet, 0 the kernel will not take PR_SET_MM_MAP, 1 it will. A
+ * fork inherits the answer, and every later exec of the process reuses it. */
+static int g_mm_map = -1;
+int cng_g_mm_map_deny = 0;
+
+/* Our own /proc/self/stat: f[i] is field i as proc(5) numbers them, for the
+ * fields that are numbers (the state letter and comm come out as 0). Returns 1
+ * when fields 1..nf-1 were all there — 45 onwards arrived in 3.5. */
+static int self_stat(unsigned long *f, int nf) {
+    char b[1024];
+    long fd = sys_openat(CNG_AT_FDCWD, "/proc/self/stat",
+                         CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return 0;
+    long n = sys_read((int)fd, b, sizeof b - 1);
+    sys_close((int)fd);
+    if (n <= 0)
+        return 0;
+    b[n] = '\0';
+    const char *p = strrchr(b, ')'); /* comm may hold spaces and parens */
+    if (!p)
+        return 0;
+    memset(f, 0, (size_t)nf * sizeof *f);
+    int i = 2;
+    for (p++; *p == ' ' && i + 1 < nf;) {
+        p++;
+        f[++i] = parse_ul(&p); /* stops at once on a letter or a '-' */
+        while (*p && *p != ' ' && *p != '\n')
+            p++;
+    }
+    return i == nf - 1;
+}
+
+/* cmdline and environ, made right the way comm is: in the kernel's own record.
+ * The kernel's /proc/<pid>/cmdline and environ read mm->arg_start..env_end,
+ * which still name the strings of the chroot-ng invocation; PR_SET_MM_MAP
+ * points them at the guest's. Nothing of ours can match that: the kernel reads
+ * the memory at read time, under its own rules, for every reader — including
+ * another process's `ps`, which under Yama's ptrace_scope 1 may not read the
+ * guest's memory itself — and host-side tools see the guest's command line
+ * rather than ours, as they already see its comm.
+ *
+ * The call replaces the whole record, so everything but the four fields being
+ * moved goes back as it is: code, data, start_brk and start_stack from
+ * /proc/self/stat (start_stack is also what SELinux's execstack check keys
+ * on), brk from brk(0). Nothing can move them in between: this runs before the
+ * program does, at load or at an emulated execve once its other threads are
+ * gone. auxv_size 0 and exe_fd -1 leave those two alone, and are what keeps
+ * the call unprivileged.
+ *
+ * Android's kernels are built without CONFIG_CHECKPOINT_RESTORE, which the
+ * call lives under, and answer EPERM (measured on 5.15, Android 15), and
+ * qemu-user refuses PR_SET_MM outright. There the record stays ours and procfs
+ * reads the guest's memory instead (put_live). Returns 1 if the record now
+ * names `a`. */
+static int point_kernel_record(const struct cng_procargs *a) {
+    int v = __atomic_load_n(&g_mm_map, __ATOMIC_RELAXED);
+    if (!v)
+        return 0;
+    if (v < 0) {
+        unsigned sz = 0;
+        v = !cng_g_mm_map_deny &&
+            sys_prctl(CNG_PR_SET_MM, CNG_PR_SET_MM_MAP_SIZE, (unsigned long)&sz,
+                      0, 0) == 0 &&
+            sz == sizeof(struct cng_prctl_mm_map);
+        __atomic_store_n(&g_mm_map, v, __ATOMIC_RELAXED);
+        if (!v)
+            return 0;
+    }
+    unsigned long f[48];
+    if (!self_stat(f, 48))
+        return 0;
+    long brk = CNG_SYS(__NR_brk, 0, 0, 0, 0, 0, 0);
+    if (brk <= 0)
+        return 0;
+    struct cng_prctl_mm_map m;
+    memset(&m, 0, sizeof m);
+    m.start_code = f[26];
+    m.end_code = f[27];
+    m.start_stack = f[28];
+    m.start_data = f[45];
+    m.end_data = f[46];
+    m.start_brk = f[47];
+    m.brk = (unsigned long)brk;
+    m.arg_start = a->arg_start;
+    m.arg_end = a->arg_end;
+    m.env_start = a->env_start;
+    m.env_end = a->env_end;
+    m.exe_fd = (unsigned)-1;
+    long r = sys_prctl(CNG_PR_SET_MM, CNG_PR_SET_MM_MAP, (unsigned long)&m,
+                       sizeof m, 0);
+    if (r != 0 && cng_g_debug)
+        cng_dprintf(2, "[cng] PR_SET_MM_MAP: %ld\n", r);
+    return r == 0;
+}
+
 void cng_procfs_publish_stack(unsigned long guest_sp) {
     if (!guest_sp)
         return;
     g_self_sp = guest_sp;
+    /* Where the strings are is known for a stack the loader just built, and
+     * only for that one: its region is the one holding this sp. */
+    struct cng_procargs args;
+    memset(&args, 0, sizeof args);
+    if (guest_sp - cng_g_stack_lo < cng_g_stack_len) {
+        args.arg_start = cng_g_arg_start;
+        args.arg_end = cng_g_arg_end;
+        args.env_start = cng_g_env_start;
+        args.env_end = cng_g_env_end;
+        args.kernel = (u32)point_kernel_record(&args);
+    }
+    g_self_args = args;
     long argc = *(long *)guest_sp;
     if (argc < 0 || argc > 4096)
         return;
@@ -1769,6 +2444,6 @@ void cng_procfs_publish_stack(unsigned long guest_sp) {
         cng_fs_cwd(cwd, sizeof cwd);
     else
         cng_strlcpy(cwd, "/", sizeof cwd);
-    cng_procreg_publish(argv, envp, auxv, alen, cng_g_exe_guest, cwd);
+    cng_procreg_publish(argv, envp, auxv, alen, &args, cng_g_exe_guest, cwd);
     set_comm(cng_g_exe_guest);
 }

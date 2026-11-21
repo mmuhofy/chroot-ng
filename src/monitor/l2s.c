@@ -30,6 +30,8 @@ int cng_g_l2s_force = 0;
 #define ST_INO_OFF   8
 #define ST_MODE_OFF  16
 #define ST_NLINK_OFF 20
+#define ST_ATIM_OFF  72
+#define ST_MTIM_OFF  88
 #define ST_SIZE      128
 /* struct statx field offsets. */
 #define STX_MASK_OFF  0
@@ -82,6 +84,10 @@ static unsigned st_mode(const void *st) {
 static int is_lnk(const void *st) { return (st_mode(st) & S_IFMT_) == S_IFLNK_; }
 static int is_reg(const void *st) { return (st_mode(st) & S_IFMT_) == S_IFREG_; }
 static int is_dir(const void *st) { return (st_mode(st) & S_IFMT_) == S_IFDIR_; }
+/* What a group's data file can be: anything a link(2) can name — a regular
+ * file, a FIFO, a socket, a device node — which is everything but a directory
+ * (EPERM) and a symlink (linked as itself, l2s_copy_symlink). */
+static int is_data(const void *st) { return !is_dir(st) && !is_lnk(st); }
 
 /* ---- name parsing / formatting ------------------------------------------ */
 
@@ -322,7 +328,8 @@ static int l2s_store_dir(char *out, size_t sz);
 
 /* Serialize the marker's read-modify-write (find + rename/unlink) across
  * processes sharing the rootfs, and across threads of one: an exclusive flock,
- * held for the update. Returns the locked fd, or -1.
+ * held for the update. Fills *h, which l2s_unlock gives back whatever the
+ * answer, and returns the locked fd, or -1.
  *
  * The lock used to be taken on the data file, opened for reading, and a data
  * file that could not be opened that way — mode 0200, mode 0000, both of which
@@ -339,10 +346,30 @@ static int l2s_store_dir(char *out, size_t sz);
  *
  * A first link asks by its source, the file that is to become the data file,
  * and that can be a FIFO or a device: only a regular file is opened to stand
- * in, since opening one of those blocks or acts. */
-static long l2s_lock(const char *data) {
+ * in, since opening one of those blocks or acts.
+ *
+ * Every signal is blocked from before the lock is asked for until it is given
+ * back, as the view's and the credentials' writers hold theirs (path.c,
+ * cred.c). On the -R tier the dispatcher runs on the guest's own mask, and a
+ * signal is delivered on the way out of any syscall an update makes: a
+ * handler that linked or unlinked a name itself opened the lock file again
+ * and waited for the lock its own thread held, forever — an flock belongs to
+ * the open file, and the second open is another one. A signal that arrives
+ * meanwhile is taken once the update is done. And the lock is given back
+ * with LOCK_UN before the close: a fork by another thread meanwhile hands the
+ * child a duplicate of the locked open file, and the close of ours alone left
+ * the lock held until the child exec'd or exited. */
+struct l2s_held {
+    long fd;            /* the locked descriptor, or -1: no lock to be had */
+    unsigned long mask; /* the signal mask to restore */
+};
+
+static long l2s_lock(const char *data, struct l2s_held *h) {
     char lk[CNG_PATH_MAX], st[ST_SIZE];
     long fd = -1;
+    unsigned long all = ~0UL;
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &all, &h->mask, 8, 0, 0);
+    h->fd = -1;
     if (l2s_store_dir(lk, sizeof lk) == 0) {
         size_t n = strlen(lk);
         if (n + 7 < sizeof lk) {
@@ -376,12 +403,15 @@ static long l2s_lock(const char *data) {
         sys_close((int)fd);
         return -1;
     }
-    return fd;
+    return h->fd = fd;
 }
 
-static void l2s_unlock(long fd) {
-    if (fd >= 0)
-        sys_close((int)fd); /* closing drops the flock */
+static void l2s_unlock(const struct l2s_held *h) {
+    if (h->fd >= 0) {
+        CNG_SYS(__NR_flock, (int)h->fd, 8 /* LOCK_UN */, 0, 0, 0, 0);
+        sys_close((int)h->fd);
+    }
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &h->mask, 0, 8, 0, 0);
 }
 
 /* ---- central store ------------------------------------------------------ */
@@ -448,11 +478,13 @@ int cng_l2s_deny(long dirfd, const char *gp) {
  *    onto this rootfs's store under the same name, and the file it named is
  *    never looked at.
  *
- * and the data file has to be there, a regular file. Everything else is an
- * ordinary symlink, whatever its last component says. The guest can no longer
- * write such a target at all (the symlinkat refusal in dispatch.c); this is
- * what keeps a tree that already holds one — from before that refusal, from
- * the host, from another tool — from being read the old way. */
+ * and the data file has to be there: a regular file, a FIFO, a socket or a
+ * device node (is_data) — whatever was linked, never a directory or a
+ * symlink. Everything else is an ordinary symlink, whatever its last
+ * component says. The guest can no longer write such a target at all (the
+ * symlinkat refusal in dispatch.c); this is what keeps a tree that already
+ * holds one — from before that refusal, from the host, from another tool —
+ * from being read the old way. */
 
 /* The view chroot-ng was started with: run.c's, never written after it is
  * published. A guest chroot narrows the view, and a group linked before it
@@ -499,6 +531,26 @@ static int l2s_store_shaped(const char *p) {
     return b - p >= 6 && !strncmp(b - 6, "/.l2s/", 6);
 }
 
+/* For a target in some "<dir>/.l2s" store — what a link carries after its
+ * rootfs tree was moved or copied — the same name in this rootfs's store,
+ * into `out`. 1 (filled, and not the target itself), 0, or -ENAMETOOLONG.
+ * Whether anything is there is the caller's question. */
+static int l2s_store_heal(const char *tgt, char *out, size_t sz) {
+    if (!l2s_store_shaped(tgt))
+        return 0;
+    char store[CNG_PATH_MAX];
+    if (l2s_store_dir(store, sizeof store) != 0)
+        return 0;
+    const char *b = l2s_basename(tgt);
+    size_t sl = strlen(store);
+    if (sl + 1 + strlen(b) >= sz)
+        return -ENAMETOOLONG;
+    memcpy(out, store, sl);
+    out[sl] = '/';
+    cng_strlcpy(out + sl + 1, b, sz - sl - 1);
+    return strcmp(out, tgt) != 0;
+}
+
 /* The data file the link at `host` names by `tgt`, into `data`: 1 (ours), 0
  * (an ordinary symlink), or -ENAMETOOLONG. *heal is set when the target is a
  * stale store path and `data` is where this rootfs's store has it: the link
@@ -523,36 +575,392 @@ static int l2s_locate(const char *host, const char *tgt, char *data,
         if (sep)
             data[dl++] = '/';
         cng_strlcpy(data + dl, b, dsz - dl);
-        return l2s_lstat(data, st) == 0 && is_reg(st);
+        return l2s_lstat(data, st) == 0 && is_data(st);
     }
     if (!l2s_canonical(tgt))
         return 0;
     if (l2s_owned(tgt)) {
         if (cng_strlcpy(data, tgt, dsz) >= dsz)
             return -ENAMETOOLONG;
-        if (l2s_lstat(data, st) == 0 && is_reg(st))
+        if (l2s_lstat(data, st) == 0 && is_data(st))
             return 1;
     }
-    if (!l2s_store_shaped(tgt))
-        return 0;
-    char store[CNG_PATH_MAX];
-    if (l2s_store_dir(store, sizeof store) != 0)
-        return 0;
-    size_t sl = strlen(store);
-    if (sl + 1 + strlen(b) >= dsz)
-        return -ENAMETOOLONG;
-    memcpy(data, store, sl);
-    data[sl] = '/';
-    cng_strlcpy(data + sl + 1, b, dsz - sl - 1);
-    if (!strcmp(data, tgt) || l2s_lstat(data, st) != 0 || !is_reg(st))
+    int k = l2s_store_heal(tgt, data, dsz);
+    if (k != 1)
+        return k;
+    if (l2s_lstat(data, st) != 0 || !is_data(st))
         return 0; /* dangling: just an ordinary symlink */
     *heal = 1;
     return 1;
 }
 
+/* ---- proot's groups -------------------------------------------------------
+ *
+ * A rootfs installed through proot (proot-distro's) carries the hardlinks
+ * proot's own link2symlink made, in a scheme of its own:
+ *
+ *   member       every name of the group: a symlink whose text is the HOST
+ *                path of the indirection, absolute;
+ *   indirection  "<prefix><name><NNNN>" — a symlink in proot's l2s directory
+ *                (proot-distro's is "<rootfs>/.l2s", the same as our store;
+ *                beside the first-linked name with no PROOT_L2S_DIR), whose
+ *                text is the host path of the data file beside it;
+ *   data         "<indirection>.<CCCC>" — the linked file itself, CCCC its
+ *                live link count. A name added or removed renames the data
+ *                file to the new count and repoints the indirection, which is
+ *                why the members name the indirection: its name never moves.
+ *
+ * <prefix> is ".l2s." (".proot.l2s." in UserLAnd's build), <name> the first
+ * name's basename, <NNNN> the first four-digit suffix free in that directory.
+ * The guest-level walk used to re-root a member's text like any absolute
+ * target, so every name dangled into "<rootfs><rootfs>/.l2s".
+ *
+ * Read here, and kept, with proot's own bookkeeping so the tree goes on
+ * working under proot: a group is presented as the one file a hardlink is
+ * (through cng_l2s_resolve, so every caller of ours sees it), a new link of a
+ * member is a member with the same text after the count went up, a removed one
+ * takes it down, and the last removes the data and the indirection. New groups
+ * are still made in the emulation's own scheme.
+ *
+ * The text of every link here is the guest's — any image can hold any text in
+ * one — so nothing of it is followed. A member's text is placed by the same
+ * rule as our own targets (a canonical absolute path in a place of the guest's
+ * own, or a stale store path healed onto this rootfs's store), and of the
+ * indirection's text only the BASENAME is used: it must be the indirection's
+ * own name plus ".<CCCC>", and the data file is taken beside the indirection —
+ * which is the directory the text has to spell (or, for a tree that was moved,
+ * a stale store path while the indirection is in a store). The data file has
+ * to be there and be a file (is_data).
+ *
+ * A count change is two renames — the data, then the indirection over a
+ * fresh symlink made under "<indirection>.cng" — so the indirection itself is
+ * never missing, but between the two it names a file that is gone. Every
+ * change of ours takes the lock (l2s_lock), re-reads the chain under it, and
+ * repairs one a killed process left cut (the one data file of that name in
+ * the directory, found by a scan); a reader that finds the data missing
+ * looks again a few times. proot takes no lock, so it and chroot-ng changing
+ * one group at the same moment can still interleave: a count can end one
+ * off. */
+
+#define PR_MAX_COUNT 9999
+#define PR_TMP_SUFFIX ".cng"
+
+static size_t pr_prefix_len(const char *name) {
+    if (!strncmp(name, ".l2s.", 5))
+        return 5;
+    if (!strncmp(name, ".proot.l2s.", 11))
+        return 11;
+    return 0;
+}
+
+static int pr_four(const char *s) {
+    for (int i = 0; i < 4; i++)
+        if (s[i] < '0' || s[i] > '9')
+            return 0;
+    return 1;
+}
+
+/* An indirection's basename: "<prefix><name><NNNN>", <name> not empty. The
+ * bound keeps the data name and the temporary inside NAME_MAX. */
+static int pr_is_ind(const char *name) {
+    size_t pl = pr_prefix_len(name), n = strlen(name);
+    return pl && n >= pl + 1 + 4 && n <= 240 && pr_four(name + n - 4);
+}
+
+/* A data basename "<ind>.<CCCC>" for the indirection basename `ind` (of
+ * length il): *count from it, a zero read as one. */
+static int pr_data_of(const char *dn, const char *ind, size_t il,
+                      unsigned long *count) {
+    if (strncmp(dn, ind, il) || dn[il] != '.' || !pr_four(dn + il + 1) ||
+        dn[il + 5])
+        return 0;
+    unsigned long c = 0;
+    for (int i = 1; i <= 4; i++)
+        c = c * 10 + (unsigned long)(dn[il + i] - '0');
+    if (count)
+        *count = c ? c : 1;
+    return 1;
+}
+
+/* Any data basename: its indirection's is all but the last five bytes. */
+static int pr_is_data(const char *dn) {
+    size_t n = strlen(dn);
+    char ind[256];
+    if (n < 6 || n - 5 >= sizeof ind)
+        return 0;
+    memcpy(ind, dn, n - 5);
+    ind[n - 5] = '\0';
+    return pr_is_ind(ind) && pr_data_of(dn, ind, n - 5, 0);
+}
+
+struct pr_group {
+    char ind[CNG_PATH_MAX];  /* the indirection's host path */
+    char data[CNG_PATH_MAX]; /* the data file's host path, as last read */
+    size_t dl;               /* length of their directory, its '/' included */
+    unsigned long count;     /* the count in the data file's name */
+};
+
+/* g->data = the indirection's directory + `dn`. */
+static int pr_set_data(struct pr_group *g, const char *dn) {
+    size_t n = strlen(dn);
+    if (g->dl + n >= sizeof g->data)
+        return -ENAMETOOLONG;
+    memcpy(g->data, g->ind, g->dl);
+    memcpy(g->data + g->dl, dn, n + 1);
+    return 0;
+}
+
+/* Read the chain from the indirection at g->ind: 1 (g->data and g->count
+ * filled; the data file is there), 0 (not a group), or -ENOENT (the
+ * indirection names a data file that is not there: another process between
+ * its two renames, or a chain a killed one left cut). */
+static int pr_chain(struct pr_group *g) {
+    char st[ST_SIZE], t2[CNG_PATH_MAX];
+    const char *ib = l2s_basename(g->ind);
+    g->dl = (size_t)(ib - g->ind);
+    if (l2s_lstat(g->ind, st) != 0 || !is_lnk(st))
+        return 0;
+    long n = l2s_readlink(g->ind, t2, sizeof t2 - 1);
+    if (n <= 0)
+        return 0;
+    t2[n] = '\0';
+    const char *db = l2s_basename(t2);
+    if (!pr_data_of(db, ib, strlen(ib), &g->count) ||
+        pr_set_data(g, db) != 0)
+        return 0;
+    /* Beside the indirection, as proot writes it — or, for a tree that was
+     * moved, any store's spelling while the indirection is in a store. */
+    if (strcmp(t2, g->data) != 0 &&
+        !(l2s_canonical(t2) && l2s_store_shaped(t2) &&
+          l2s_store_shaped(g->ind)))
+        return 0;
+    long r = l2s_lstat(g->data, st);
+    if (r == -ENOENT)
+        return -ENOENT;
+    return r == 0 && is_data(st);
+}
+
+/* The group's one data file in its directory, by a scan for
+ * "<indirection>.<CCCC>": a count change only ever renames it, so there is
+ * one. For a chain left cut. 0 (g->data and g->count filled), -ENOENT (none:
+ * the group is gone) or -EIO (more than one: not guessed at). */
+static int pr_find_data(struct pr_group *g) {
+    char dir[CNG_PATH_MAX], st[ST_SIZE], dn[256];
+    const char *ib = l2s_basename(g->ind);
+    size_t il = strlen(ib);
+    l2s_dirname(g->ind, dir, sizeof dir);
+    long fd = cng_pin_open(dir, CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC,
+                           0);
+    if (fd < 0)
+        return (int)fd;
+    char buf[4096];
+    int found = 0;
+    unsigned long c = 0;
+    for (;;) {
+        long n = CNG_SYS(__NR_getdents64, (int)fd, buf, sizeof buf, 0, 0, 0);
+        if (n <= 0)
+            break;
+        for (long o = 0; o + 19 <= n;) {
+            unsigned short reclen;
+            memcpy(&reclen, buf + o + 16, 2);
+            if (reclen == 0 || o + reclen > n)
+                break;
+            const char *nm = buf + o + 19;
+            unsigned long nc;
+            o += reclen;
+            if (!pr_data_of(nm, ib, il, &nc) ||
+                CNG_SYS(__NR_newfstatat, (int)fd, nm, st,
+                        CNG_AT_SYMLINK_NOFOLLOW, 0, 0) != 0 ||
+                !is_data(st))
+                continue;
+            if (found++)
+                break;
+            cng_strlcpy(dn, nm, sizeof dn);
+            c = nc;
+        }
+        if (found > 1)
+            break;
+    }
+    sys_close((int)fd);
+    if (found != 1)
+        return found ? -EIO : -ENOENT;
+    g->count = c;
+    return pr_set_data(g, dn);
+}
+
+/* Point the indirection at g->data: a symlink made under the temporary name
+ * and renamed over it, so the indirection is never missing. Its text is the
+ * data file's host path as it is spelled now, which also heals a moved
+ * tree's. 0 or -errno. */
+static long pr_repoint(struct pr_group *g) {
+    char tmp[CNG_PATH_MAX];
+    size_t il = strlen(g->ind);
+    if (il + sizeof PR_TMP_SUFFIX > sizeof tmp)
+        return -ENAMETOOLONG;
+    memcpy(tmp, g->ind, il);
+    memcpy(tmp + il, PR_TMP_SUFFIX, sizeof PR_TMP_SUFFIX);
+    l2s_unlink(tmp); /* one a killed update left */
+    long r = l2s_symlink(g->data, tmp);
+    if (r == 0 && (r = l2s_rename(tmp, g->ind)) < 0)
+        l2s_unlink(tmp);
+    return r;
+}
+
+/* Under the lock: the chain as it is now, made whole where it is cut. 1, 0
+ * (not a group, or gone) or -errno. */
+static int pr_settle(struct pr_group *g) {
+    int r = pr_chain(g);
+    if (r != -ENOENT)
+        return r;
+    if (pr_find_data(g) != 0)
+        return 0;
+    L2S_LOG("[cng] l2s: proot group %s was cut, repointed\n", g->ind);
+    return pr_repoint(g) == 0 ? 1 : 0;
+}
+
+/* Move the count by `delta` (+1/-1), proot's own steps: the data file renamed
+ * to its new count, the indirection repointed. Under the lock, after
+ * pr_settle. The last name dropped removes the data and the indirection. 0 or
+ * -errno; on failure nothing has moved. */
+static long pr_adjust(struct pr_group *g, int delta) {
+    if (delta < 0 && g->count <= 1) {
+        l2s_unlink(g->data);
+        l2s_unlink(g->ind);
+        return 0;
+    }
+    if (delta > 0 && g->count >= PR_MAX_COUNT)
+        return -EMLINK;
+    unsigned long nc = g->count + (unsigned long)(long)delta;
+    char old[CNG_PATH_MAX], dn[256], *p = dn;
+    const char *ib = l2s_basename(g->ind);
+    size_t il = strlen(ib);
+    if (il + 6 > sizeof dn)
+        return -ENAMETOOLONG;
+    memcpy(p, ib, il);
+    p += il;
+    *p++ = '.';
+    put_u64(&p, dn + sizeof dn - 1, nc, 4);
+    *p = '\0';
+    cng_strlcpy(old, g->data, sizeof old);
+    if (pr_set_data(g, dn) != 0)
+        return -ENAMETOOLONG;
+    long r = l2s_rename(old, g->data);
+    if (r == 0 && (r = pr_repoint(g)) < 0)
+        l2s_rename(g->data, old); /* the count back */
+    if (r < 0) {
+        cng_strlcpy(g->data, old, sizeof g->data);
+        return r;
+    }
+    g->count = nc;
+    return 0;
+}
+
+/* pr_chain, looked at again a few times while the data file is missing:
+ * another process of ours is between the two renames of a count change. */
+static int pr_chain_look(struct pr_group *g) {
+    int r = pr_chain(g);
+    for (int i = 0; i < 3 && r == -ENOENT; i++) {
+        if (!cng_blocked[__NR_sched_yield])
+            CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+        r = pr_chain(g);
+    }
+    return r;
+}
+
+/* If the symlink `host` (its text `tgt`) is a member of a proot group, fill
+ * *g: 1, else 0. The indirection is where the text says, in a place of the
+ * guest's own, or — the text a stale store path — in this rootfs's store,
+ * and then the member is repointed at it, as a stale link of ours is.
+ *
+ * A chain cut for good (its data file not where the indirection says, after
+ * the looks) is still a member, with g->data the missing file: a stat of it
+ * fails, so to the guest it is the dangling symlink proot shows too, while an
+ * unlink or a link of it is the change of the group that mends the chain
+ * under the lock (pr_settle) and moves the count. Taken for an ordinary
+ * symlink, the unlink left the count high for good and a link made a member
+ * the count never had. */
+static int pr_member(const char *host, const char *tgt, struct pr_group *g) {
+    if (tgt[0] != '/' || !pr_is_ind(l2s_basename(tgt)) || !l2s_canonical(tgt))
+        return 0;
+    int r = 0, heal = 0;
+    if (l2s_owned(tgt) &&
+        cng_strlcpy(g->ind, tgt, sizeof g->ind) < sizeof g->ind)
+        r = pr_chain_look(g);
+    if (r == 0) {
+        if (l2s_store_heal(tgt, g->ind, sizeof g->ind) != 1)
+            return 0;
+        heal = 1;
+        r = pr_chain_look(g);
+    }
+    if (r != 1 && r != -ENOENT)
+        return 0;
+    if (heal) {
+        l2s_unlink(host);
+        l2s_symlink(g->ind, host);
+    }
+    return 1;
+}
+
+/* Is the file at `host` a proot data file — its indirection beside it, naming
+ * it? `host` canonical, in a place of the guest's own. 1 (*g filled) or 0. */
+static int pr_data_here(const char *host, struct pr_group *g) {
+    const char *b = l2s_basename(host);
+    size_t n = strlen(host);
+    if (!pr_is_data(b) || n - 5 >= sizeof g->ind || !l2s_canonical(host) ||
+        !l2s_owned(host))
+        return 0;
+    memcpy(g->ind, host, n - 5);
+    g->ind[n - 5] = '\0';
+    return pr_chain(g) == 1 && !strcmp(g->data, host);
+}
+
+/* The indirection of the data file `data`: all but its ".<CCCC>". */
+static int pr_from_data(const char *data, struct pr_group *g) {
+    size_t n = strlen(data);
+    if (n < 6 || n - 5 >= sizeof g->ind)
+        return -ENAMETOOLONG;
+    memcpy(g->ind, data, n - 5);
+    g->ind[n - 5] = '\0';
+    return 0;
+}
+
+/* A new name `dst` of the proot group whose data file is `data` (as a
+ * resolve read it): the count raised first, then a member carrying the
+ * indirection's host path, as proot makes one; where the member cannot be
+ * made, the count is put back. 0 or -errno. */
+static int pr_link(const char *data, const char *dst) {
+    struct pr_group g;
+    if (pr_from_data(data, &g) != 0)
+        return -ENAMETOOLONG;
+    struct l2s_held lk;
+    l2s_lock(data, &lk);
+    int k = pr_settle(&g);
+    long r = k == 1 ? pr_adjust(&g, 1) : k < 0 ? k : -ENOENT;
+    if (r == 0 && (r = l2s_symlink(g.ind, dst)) < 0)
+        pr_adjust(&g, -1);
+    l2s_unlock(&lk);
+    return (int)r;
+}
+
+/* A name of the proot group whose data file is `data` is gone: the count
+ * lowered, and with the last name the data file and the indirection. */
+static void pr_drop(const char *data) {
+    struct pr_group g;
+    if (pr_from_data(data, &g) != 0)
+        return;
+    struct l2s_held lk;
+    l2s_lock(data, &lk);
+    if (pr_settle(&g) == 1)
+        pr_adjust(&g, -1);
+    l2s_unlock(&lk);
+}
+
 int cng_l2s_untranslate_target(const char *tgt, char *out, size_t sz) {
     const char *b = l2s_basename(tgt);
-    if (tgt[0] != '/' || !parse_data_exact(b, 0) || !l2s_canonical(tgt))
+    /* Ours names a data file; proot's members name an indirection, and an
+     * indirection names a data file of its own grammar. */
+    if (tgt[0] != '/' || !l2s_canonical(tgt) ||
+        !(parse_data_exact(b, 0) || pr_is_ind(b) || pr_is_data(b)))
         return 0;
     if (cng_g_fs && cng_host_dir_guest(tgt, out, sz) == 0)
         return 1;
@@ -589,6 +997,16 @@ int cng_l2s_resolve(const char *host, char *data, size_t dsz,
 
     int heal;
     int k = l2s_locate(host, tgt, data, dsz, &heal);
+    if (k == 0) { /* not ours: one of proot's? */
+        struct pr_group g;
+        if (pr_member(host, tgt, &g) != 1)
+            return 0;
+        if (cng_strlcpy(data, g.data, dsz) >= dsz)
+            return -ENAMETOOLONG;
+        if (count)
+            *count = g.count;
+        return 1;
+    }
     if (k != 1)
         return k;
     if (heal) { /* repoint the stale link at its data (best effort) */
@@ -630,19 +1048,39 @@ static int l2s_target(const char *host, char *data, size_t dsz,
         }
         return 1;
     }
+    struct pr_group g;
+    if (pr_data_here(host, &g)) {
+        if (cng_strlcpy(data, host, dsz) >= dsz)
+            return -ENAMETOOLONG;
+        if (count)
+            *count = g.count;
+        return 1;
+    }
     return 0;
 }
 
 /* Copy the contents of `src` (opened, follows /proc/self/fd/N) into a new
  * regular file `dst`. Used when src has no named regular inode to symlink to
- * (e.g. /proc/self/fd/N naming an O_TMPFILE), or the link spans directories. */
+ * (e.g. /proc/self/fd/N naming an O_TMPFILE), or the link spans directories.
+ * Only a regular file has contents to copy, and only one is opened: opening a
+ * FIFO blocked the linker until a writer came (`ln fifo fifo2` hung), and
+ * opening a device acts on it. The type is asked first, and the open is
+ * non-blocking and takes no terminal, for a file swapped in between. */
 static int l2s_materialize(const char *src, const char *dst) {
-    long in = cng_pin_open(src, CNG_O_RDONLY | CNG_O_CLOEXEC, 0);
+    char st[ST_SIZE];
+    long sr = l2s_statf(src, st);
+    if (sr < 0)
+        return (int)sr;
+    if (!is_reg(st))
+        return -EPERM; /* link(2) on a directory; a node it cannot group */
+    long in = cng_pin_open(src,
+                           CNG_O_RDONLY | CNG_O_NONBLOCK | CNG_O_NOCTTY |
+                               CNG_O_CLOEXEC,
+                           0);
     if (in < 0)
         return (int)in;
     /* A real hardlink shares the source's mode; the copy must too (apk
      * publishes its database files this way — 0644, not 0755). */
-    char st[ST_SIZE];
     unsigned mode = 0644;
     if (CNG_SYS(__NR_fstat, (int)in, st, 0, 0, 0, 0) == 0) {
         if (!is_reg(st)) {
@@ -685,6 +1123,47 @@ static int l2s_materialize(const char *src, const char *dst) {
     return (int)rc;
 }
 
+/* The host's /proc: the one place a symlink is not the guest's but a
+ * descriptor's magic link (the AT_EMPTY_PATH source is spelled as one), the
+ * same zone pin.c hands over unpinned. */
+static int l2s_under_proc(const char *p) {
+    return strncmp(p, "/proc", 5) == 0 && (p[5] == '\0' || p[5] == '/');
+}
+
+/* link(2) of a symlink links the symlink itself: the kernel gives the new name
+ * the same inode, so it reads the same text. A symlink cannot be a group's
+ * data file — a group's names are followed onto it, and a relative text would
+ * then be read against the store — so the new name is a second symlink with
+ * that text, carrying the original's times as one inode would (its count
+ * stays 1, the one divergence). The source is read, never opened or followed:
+ * l2s_materialize used to open it, which the pin refused with ELOOP. A text
+ * in the ".l2s." grammar is not copied, as the guest's own symlinkat of one
+ * is refused (dispatch.c): beside a data file of that name the copy would be
+ * taken for a name of its group that was never counted. 0 or -errno. */
+static int l2s_copy_symlink(const char *src, const char *dst, const void *st) {
+    char tgt[CNG_PATH_MAX];
+    long n = l2s_readlink(src, tgt, sizeof tgt - 1);
+    if (n < 0)
+        return (int)n;
+    tgt[n] = '\0';
+    if (cng_l2s_hidden(l2s_basename(tgt)))
+        return -EPERM;
+    long r = l2s_symlink(tgt, dst);
+    if (r < 0)
+        return (int)r;
+    if (!cng_blocked[__NR_utimensat]) {
+        struct cng_pin p;
+        long ts[4];
+        memcpy(ts, (const char *)st + ST_ATIM_OFF, sizeof ts / 2);
+        memcpy(ts + 2, (const char *)st + ST_MTIM_OFF, sizeof ts / 2);
+        if (cng_pin_at(CNG_AT_FDCWD, dst, &p) == 0)
+            CNG_SYS(__NR_utimensat, p.dfd, (long)p.name, (long)ts,
+                    CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
+        cng_unpin(&p);
+    }
+    return 0;
+}
+
 /* What `src` is to a link: 1 a member of a group (`data` and `*count`
  * filled), 0 a file of its own, or -errno. */
 static int l2s_link_source(const char *src, int own, char *data, size_t dsz,
@@ -697,12 +1176,17 @@ static int l2s_link_source(const char *src, int own, char *data, size_t dsz,
     /* AT_SYMLINK_FOLLOW may have resolved src straight onto the data file. */
     char st[ST_SIZE], sdir[CNG_PATH_MAX];
     unsigned long long ino;
-    if (isl == 0 && own && l2s_lstat(src, st) == 0 && is_reg(st) &&
+    struct pr_group g;
+    if (isl == 0 && own && l2s_lstat(src, st) == 0 && is_data(st) &&
         parse_data_exact(l2s_basename(src), &ino)) {
         cng_strlcpy(data, src, dsz);
         l2s_dirname(src, sdir, sizeof sdir);
         if (find_marker(sdir, ino, count) != 0)
             *count = 0;
+        isl = 1;
+    } else if (isl == 0 && own && pr_data_here(src, &g)) {
+        cng_strlcpy(data, src, dsz);
+        *count = g.count;
         isl = 1;
     }
     return isl;
@@ -715,8 +1199,9 @@ static int l2s_link_source(const char *src, int own, char *data, size_t dsz,
  * the first made the group. So the symlink is made under `data` first and the
  * two names exchanged in one renameat2: the name is the file, then the link
  * to it. Where the exchange cannot be had — no renameat2, a filesystem
- * without RENAME_EXCHANGE, a stale entry under `data` — the two steps stand.
- * 0 or -errno; on failure nothing has moved. */
+ * without RENAME_EXCHANGE, a stale symlink of ours under `data` — the two
+ * steps stand; any other file under `data` is EEXIST. 0 or -errno; on
+ * failure nothing has moved. */
 static long l2s_swap_in(const char *src, const char *data, const char *tgt) {
     long r = l2s_symlink(tgt, data);
     if (r == 0) {
@@ -726,6 +1211,18 @@ static long l2s_swap_in(const char *src, const char *data, const char *tgt) {
     }
     L2S_LOG("[cng] l2s: no exchange for %s (%ld): rename, then symlink\n", src,
             r);
+    /* The rename replaces whatever is under `data`, so it is made over
+     * nothing, or over the symlink a swap killed after its first step left
+     * (its text is `tgt`) — never over a file of someone else's. The store
+     * is proot-distro's l2s directory too, and an indirection of proot's for
+     * a file named by digits (".l2s.<digits>") spells a data name of ours;
+     * so does a data file whose tree was copied in under another inode. */
+    char st[ST_SIZE], old[CNG_PATH_MAX];
+    if (l2s_lstat(data, st) == 0) {
+        long n = is_lnk(st) ? l2s_readlink(data, old, sizeof old - 1) : -1;
+        if (n < 0 || (old[n] = '\0', strcmp(old, tgt) != 0))
+            return -EEXIST;
+    }
     r = l2s_rename(src, data);
     if (r < 0)
         return r;
@@ -759,7 +1256,15 @@ static int l2s_first_link(const char *src, const char *dst, const char *ddir,
         L2S_LOG("[cng] l2s: src %s missing\n", src);
         return -ENOENT;
     }
-    if (!is_reg(st) || !own) /* e.g. /proc/self/fd/N O_TMPFILE: copy contents */
+    /* A descriptor's magic link is followed by the copy below, as the
+     * AT_EMPTY_PATH publish means it to be; any other symlink is linked as
+     * itself. */
+    if (is_lnk(st) && !l2s_under_proc(src))
+        return l2s_copy_symlink(src, dst, st);
+    /* A FIFO, a socket or a device node becomes a group as a regular file
+     * does: the node itself moves into the store, so every name opens the one
+     * pipe, connects to the one socket. A copy cannot stand in for those. */
+    if (!is_data(st) || !own) /* e.g. /proc/self/fd/N O_TMPFILE: copy contents */
         return 1;
     ino = *(unsigned long long *)((char *)st + ST_INO_OFF);
 
@@ -853,17 +1358,21 @@ int cng_l2s_link(const char *src, const char *dst) {
      * where the store cannot be had, that is what the group's own updates
      * lock (l2s_lock). */
     if (isl <= 0) {
-        long lk = l2s_lock(src);
+        struct l2s_held lk;
+        l2s_lock(src, &lk);
         isl = l2s_link_source(src, own, data, sizeof data, &count);
         if (isl == 0) {
             int r = l2s_first_link(src, dst, ddir, own);
-            l2s_unlock(lk);
+            l2s_unlock(&lk);
             return r == 1 ? l2s_materialize(src, dst) : r;
         }
-        l2s_unlock(lk);
+        l2s_unlock(&lk);
     }
     if (isl < 0)
         return isl;
+
+    if (pr_is_data(l2s_basename(data)))
+        return pr_link(data, dst);
 
     /* Existing group (either format): bump the marker beside the data,
      * then point dst at it — same-directory relative target when dst sits
@@ -871,13 +1380,14 @@ int cng_l2s_link(const char *src, const char *dst) {
      * (how names in other directories join a group). */
     parse_data(l2s_basename(data), &ino);
     l2s_dirname(data, sdir, sizeof sdir);
-    long lk = l2s_lock(data);
-    if (lk >= 0 && find_marker(sdir, ino, &count) != 0)
+    struct l2s_held lk;
+    l2s_lock(data, &lk);
+    if (lk.fd >= 0 && find_marker(sdir, ino, &count) != 0)
         count = 0; /* re-read under the lock */
     char newm[CNG_PATH_MAX], oldm[CNG_PATH_MAX];
     unsigned long nc = (count ? count : 1) + 1;
     if (build_name(newm, sizeof newm, sdir, ino, (long)nc) < 0) {
-        l2s_unlock(lk);
+        l2s_unlock(&lk);
         return -ENAMETOOLONG;
     }
     int bumped = 0;
@@ -894,10 +1404,10 @@ int cng_l2s_link(const char *src, const char *dst) {
             l2s_rename(newm, oldm);
         else
             l2s_unlink(newm);
-        l2s_unlock(lk);
+        l2s_unlock(&lk);
         return (int)sr;
     }
-    l2s_unlock(lk);
+    l2s_unlock(&lk);
     return 0;
 }
 
@@ -928,12 +1438,17 @@ void cng_l2s_rename_fixup(const char *dsth, const char *absdata) {
 
 void cng_l2s_decref(const char *data, unsigned long count) {
     unsigned long long ino;
+    if (pr_is_data(l2s_basename(data))) {
+        pr_drop(data);
+        return;
+    }
     if (!parse_data(l2s_basename(data), &ino))
         return;
     char dir[CNG_PATH_MAX], m[CNG_PATH_MAX], newm[CNG_PATH_MAX];
     l2s_dirname(data, dir, sizeof dir);
-    long lk = l2s_lock(data);
-    if (lk >= 0) {
+    struct l2s_held lk;
+    l2s_lock(data, &lk);
+    if (lk.fd >= 0) {
         unsigned long c;
         if (find_marker(dir, ino, &c) == 0)
             count = c; /* fresher than the caller's pre-unlink read */
@@ -942,13 +1457,13 @@ void cng_l2s_decref(const char *data, unsigned long count) {
         l2s_unlink(data);
         if (build_name(m, sizeof m, dir, ino, (long)(count ? count : 1)) == 0)
             l2s_unlink(m);
-        l2s_unlock(lk);
+        l2s_unlock(&lk);
         return;
     }
     if (build_name(m, sizeof m, dir, ino, (long)count) == 0 &&
         build_name(newm, sizeof newm, dir, ino, (long)(count - 1)) == 0)
         l2s_rename(m, newm);
-    l2s_unlock(lk);
+    l2s_unlock(&lk);
 }
 
 int cng_l2s_stat(const char *host, void *statbuf) {
@@ -997,7 +1512,12 @@ static int l2s_fd_count(long fd, unsigned long *count) {
         return 0;
     path[n] = '\0';
     /* Where the kernel says the file is, which is only a data file of ours
-     * in a place of the guest's own (see l2s_locate). */
+     * — or of proot's — in a place of the guest's own (see l2s_locate). */
+    struct pr_group g;
+    if (pr_data_here(path, &g)) {
+        *count = g.count;
+        return 1;
+    }
     unsigned long long ino;
     if (!parse_data_exact(l2s_basename(path), &ino) || !l2s_canonical(path) ||
         !l2s_owned(path))
@@ -1030,7 +1550,8 @@ int cng_l2s_dirent(long dirfd, const char *name, unsigned long long *ino,
                    unsigned *type) {
     /* One readlink tells an ordinary symlink from ours: the target of ours
      * is a data file's name, absolute (the store, or a legacy group joined
-     * from another directory) or bare (a legacy same-directory link). A name
+     * from another directory) or bare (a legacy same-directory link); a
+     * member of proot's names an indirection, by an absolute path. A name
      * that is not a symlink at all answers EINVAL here, which is what makes
      * this cheap enough to ask about a DT_UNKNOWN record too. */
     char tgt[CNG_PATH_MAX];
@@ -1039,7 +1560,8 @@ int cng_l2s_dirent(long dirfd, const char *name, unsigned long long *ino,
         return 0;
     tgt[n] = '\0';
     const char *b = l2s_basename(tgt);
-    if (!parse_data_exact(b, 0) || (tgt[0] != '/' && b != tgt))
+    if (tgt[0] == '/' ? !(parse_data_exact(b, 0) || pr_is_ind(b))
+                      : (b != tgt || !parse_data_exact(b, 0)))
         return 0;
     /* What stat(2) of the name answers is the data file — a follow lands on
      * it — so the record carries that inode and type. The target is asked
@@ -1054,13 +1576,14 @@ int cng_l2s_dirent(long dirfd, const char *name, unsigned long long *ino,
                      CNG_AT_SYMLINK_NOFOLLOW, 0, 0);
     else if (l2s_canonical(tgt) && l2s_owned(tgt))
         sr = cng_pin_fstatat(tgt, st, CNG_AT_SYMLINK_NOFOLLOW);
-    if (sr < 0 || !is_reg(st)) {
+    if (sr < 0 || !is_data(st)) {
         if (tgt[0] != '/')
             return 0; /* a bare name with no data beside it: not ours */
         /* Not a data file where it says: an absolute target whose rootfs tree
          * was moved or copied, which cng_l2s_stat self-heals onto the current
-         * store, or no link of ours at all — and a listing must say what the
-         * stat after it will. */
+         * store, a member of proot's (the target is its indirection), or no
+         * link of ours at all — and a listing must say what the stat after it
+         * will. */
         char host[CNG_PATH_MAX];
         size_t dl;
         if (l2s_fd_dir(dirfd, host, sizeof host) < 0 ||

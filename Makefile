@@ -64,9 +64,11 @@ CFLAGS  += $(shell $(CC) -mno-outline-atomics -E -x c /dev/null >/dev/null 2>&1 
 # for a pointer — which cost a guest d0/d1/d16 across an openat (measured; see
 # the sentinels in cng_rwtest_fn). Saving all 32 q registers per rewritten
 # syscall would cost 512 bytes of stack traffic on the hot path and still leave
-# the live registers wrong at a ptrace stop; not generating the instructions in
-# the first place costs nothing and is enforced at build time. Deliberately not
-# probed: silently dropping it would put the clobber back.
+# the live registers wrong at a ptrace stop, where a stop with no signal frame
+# reads and writes them as the guest's (NT_PRFPREG, src/monitor/ptrace.c); not
+# generating the instructions in the first place costs nothing and is enforced
+# at build time. Deliberately not probed: silently dropping it would put the
+# clobber back.
 CFLAGS  += -mgeneral-regs-only
 # Link chroot-ng far above the guest ET_EXEC range via an explicit linker script
 # (scripts/chroot-ng.ld). A non-PIE guest (notably gcc's cc1) loads at the fixed
@@ -97,7 +99,9 @@ BIN  := $(BUILD)/chroot-ng
 .PHONY: all clean run test probe
 all: $(BIN)
 
-$(BIN): $(OBJ)
+# The linker script shapes the image as much as the objects do (its PHDRS is
+# the whole program header table), so a change to it relinks.
+$(BIN): $(OBJ) scripts/chroot-ng.ld
 	$(CC) $(LDFLAGS) -o $@ $(OBJ)
 	@echo "built $@"
 

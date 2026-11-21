@@ -69,6 +69,11 @@
 #define CNG_MAP_FIXED_NOREPLACE 0x100000
 #define CNG_MAP_FAILED          ((void *)-1L)
 
+/* mremap flags */
+#define CNG_MREMAP_MAYMOVE   0x1
+#define CNG_MREMAP_FIXED     0x2
+#define CNG_MREMAP_DONTUNMAP 0x4 /* 5.7; any private mapping since 5.13 */
+
 /* openat2(2): struct open_how and its resolve constraints. The struct is the
  * kernel's ABI — three u64s, and `size` is checked against it — so it is
  * spelled out here rather than read a field at a time. */
@@ -97,6 +102,15 @@ struct cng_open_how {
 
 /* memfd_create flags */
 #define CNG_MFD_CLOEXEC 1
+
+/* Android's ashmem (/dev/ashmem), the backing a libandroid-shmem peer can size
+ * (broker.c). SET_NAME copies up to the whole ASHMEM_NAME_LEN buffer from the
+ * caller; SET_SIZE takes the size by value and must come before the first
+ * mmap. */
+#define CNG_ASHMEM_NAME_LEN 256
+#define CNG_ASHMEM_SET_NAME 0x41007701u /* _IOW(0x77, 1, char[256]) */
+#define CNG_ASHMEM_SET_SIZE 0x40087703u /* _IOW(0x77, 3, size_t) */
+#define CNG_ASHMEM_GET_SIZE 0x00007704u /* _IO(0x77, 4) */
 
 /* clock_gettime clocks. BOOTTIME counts suspend, which is what /proc/uptime
  * reports (CLOCK_MONOTONIC does not). */
@@ -129,6 +143,7 @@ struct cng_open_how {
 #define CNG_PR_GET_NO_NEW_PRIVS 39
 #define CNG_PR_SET_SECCOMP      22
 #define CNG_PR_GET_SECCOMP      21
+#define CNG_PR_CAPBSET_READ     23 /* EINVAL past CAP_LAST_CAP */
 #define CNG_PR_SET_TAGGED_ADDR_CTRL 55
 #define CNG_PR_GET_TAGGED_ADDR_CTRL 56
 /* Memory-Deny-Write-Execute (Linux 6.3+): with REFUSE_EXEC_GAIN set, an
@@ -137,6 +152,21 @@ struct cng_open_how {
  * can reach the loader's fall back from the anonymous strategy. */
 #define CNG_PR_SET_MDWE             65
 #define CNG_PR_MDWE_REFUSE_EXEC_GAIN 1
+/* PR_SET_MM_MAP (3.18+, CONFIG_CHECKPOINT_RESTORE): rewrite the kernel's whole
+ * record of where a process's code, data, brk, stack, argv and environment
+ * lie in one call, unprivileged as long as the exe link is left alone
+ * (exe_fd -1) and auxv_size is 0. The _SIZE form answers the struct's size.
+ * A kernel built without the option refuses both with EPERM. */
+#define CNG_PR_SET_MM               35
+#define CNG_PR_SET_MM_MAP           14
+#define CNG_PR_SET_MM_MAP_SIZE      15
+struct cng_prctl_mm_map {
+    unsigned long start_code, end_code, start_data, end_data;
+    unsigned long start_brk, brk, start_stack;
+    unsigned long arg_start, arg_end, env_start, env_end;
+    unsigned long *auxv;
+    unsigned auxv_size, exe_fd;
+};
 
 /* seccomp */
 #define CNG_SECCOMP_MODE_FILTER      2
@@ -197,20 +227,28 @@ struct cng_open_how {
 /* AF_UNIX sockets + ppoll — the --shared-proc registry broker (procreg.c). */
 #define CNG_AF_UNIX      1
 #define CNG_SOCK_STREAM  1
+#define CNG_SOCK_SEQPACKET 5
 #define CNG_SOCK_CLOEXEC CNG_O_CLOEXEC
 #define CNG_SOL_SOCKET   1
 #define CNG_SO_RCVTIMEO  20 /* SO_RCVTIMEO_OLD: takes the 64-bit timeval */
 #define CNG_SO_SNDTIMEO  21 /* SO_SNDTIMEO_OLD, likewise */
 #define CNG_SO_PEERCRED  17
+#define CNG_SO_PEERGROUPS 59 /* the peer's supplementary groups (4.13+) */
 #define CNG_SO_SNDBUF    7
 #define CNG_SO_DOMAIN    39 /* the socket's own address family, in one call */
 #define CNG_SCM_RIGHTS   1
+#define CNG_SCM_CREDENTIALS 2 /* payload: struct ucred, pid uid gid (u32 each) */
+#define CNG_AF_NETLINK   16 /* the other family whose sendmsg judges SCM_* */
 #define CNG_MSG_NOSIGNAL 0x4000
 #define CNG_MSG_DONTWAIT 0x40
 #define CNG_MSG_OOB      0x1  /* msg_flags: out-of-band data, which ends a batch */
 #define CNG_MSG_CTRUNC   0x8  /* msg_flags: control data was cut */
 #define CNG_MSG_WAITFORONE 0x10000 /* recvmmsg: return once one message is in */
 #define CNG_POLLIN       1
+#define CNG_POLLERR      0x8
+#define CNG_POLLHUP      0x10
+#define CNG_POLLNVAL     0x20
+#define CNG_POLLRDHUP    0x2000 /* the peer will send no more */
 
 /* The kernel clamps sendmmsg/recvmmsg's vlen to this (UIO_MAXIOV) before it
  * loops, so the array forms bound their own walk the same way. */

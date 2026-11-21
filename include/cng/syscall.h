@@ -21,14 +21,31 @@
 /* Defined in src/rt/gate.S. Arguments in AAPCS64 order: a0..a5 then nr. */
 long cng_syscall6(long a0, long a1, long a2, long a3, long a4, long a5,
                   long nr);
+/* ...with the svc made on the stack `sp` (16-aligned), for a dispatch that
+ * blocks on the guest's behalf from guest context (see gate.S). */
+long cng_syscall6_on(long a0, long a1, long a2, long a3, long a4, long a5,
+                     long nr, unsigned long sp);
 
 /* Linker-provided bounds of the gate (see gate.S). */
 extern char __cng_gate_start[];
 extern char __cng_gate_end[];
-/* The bounce stub in the gate (see gate.S): where a trap frame is pointed to
- * run a mask-taking wait in guest context, and where its completion traps. */
+/* The bounce stubs (see gate.S): where a trap frame is pointed to run a call
+ * in guest context — the guest's own (a mask-taking wait among them), or its
+ * whole dispatch — and where the completion of either traps. */
 extern char cng_bounce_wait[];
+extern char cng_bounce_dispatch[];
 extern char cng_bounce_svc_end[];
+
+/* The kickable wait in the gate (see gate.S): wait4/waitid `nr` with a0..a4,
+ * made only while *kicks still reads `seen`. CNG_WAIT_KICKED means a ptrace
+ * kick came first or cut the wait short; nothing else returns it. The labels
+ * are what the kick handler tests the interrupted pc against. */
+#define CNG_WAIT_KICKED (-512)
+long cng_wait_unless(long a0, long a1, long a2, long a3, long a4, long nr,
+                     const volatile unsigned *kicks, unsigned seen);
+extern char cng_wait_unless_check[];
+extern char cng_wait_unless_svc[];
+extern char cng_wait_unless_bail[];
 
 #define CNG_SYS(nr, a, b, c, d, e, f)                                          \
     cng_syscall6((long)(a), (long)(b), (long)(c), (long)(d), (long)(e),        \

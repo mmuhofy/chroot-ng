@@ -35,6 +35,10 @@ static inline int cng_page_end(unsigned long a, unsigned long n,
     return 0;
 }
 
+/* PT_LOADs with a file part a load records (cng_loaded.copied). Linkers emit
+ * two to four. */
+#define CNG_LOAD_COPIED 8
+
 struct cng_loaded {
     unsigned long entry;   /* absolute entry point (bias + e_entry) */
     unsigned long phdr;    /* absolute address of program headers in memory */
@@ -49,6 +53,16 @@ struct cng_loaded {
      * on top. load_hi is where the object's own pages end; this is where the
      * reservation does. */
     unsigned long map_lo, map_len;
+    /* The pages the anonymous strategy filled from the file, one range per
+     * PT_LOAD with a file part: to the kernel each would be a private mapping
+     * of the file, and an mremap(MREMAP_DONTUNMAP) of one has to leave what a
+     * file mapping leaves (cng_execmap_dontunmap). None after the file-backed
+     * strategy, whose mappings are the file's own. A PT_LOAD past the table
+     * is not recorded and moves as the anonymous memory it is. */
+    struct cng_load_range {
+        unsigned long lo, hi;
+    } copied[CNG_LOAD_COPIED];
+    int ncopied;
     int is_dyn;            /* ET_DYN vs ET_EXEC */
     int has_interp;        /* PT_INTERP present */
     char interp[256];      /* interpreter path if has_interp */
@@ -76,6 +90,13 @@ struct cng_loaded {
  * it replaces, and at CNG_GUEST_STACK_SIZE plus the guard it is the largest
  * single thing there is to give. */
 extern unsigned long cng_g_stack_lo, cng_g_stack_len;
+
+/* ...and where in it that build put the strings, as the kernel records them in
+ * mm->arg_start..arg_end (argv, NUL-joined) and env_start..env_end (envp, the
+ * same; AT_EXECFN follows outside both). /proc/<pid>/cmdline and environ read
+ * those ranges of live memory, not the vectors that point into them. */
+extern unsigned long cng_g_arg_start, cng_g_arg_end;
+extern unsigned long cng_g_env_start, cng_g_env_end;
 
 /* Force file-backed segment mapping (mmap PROT_EXEC from the file) instead of
  * anon copy+mprotect. Set automatically after the first anon-exec denial (e.g.

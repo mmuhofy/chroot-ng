@@ -43,10 +43,11 @@ vfork/`posix_spawn` child-stack handling.
   to entry. A static-PIE glibc guest runs end-to-end under qemu: correct
   argc/argv/env, live syscall, glibc init + self-relocation, exit code. This is
   the `noexec` defeat (file only ever opened O_RDONLY + read).
-  Known limitations (tracked for later):
+  Known limitations:
   - ET_EXEC guests at a fixed vaddr that collides with the non-PIE loader
-    (0x400000) are unsupported; Android guests are PIE so this is moot. Fixing
-    needs a static-PIE self-relocating loader.
+    (0x400000) were unsupported at first. Closed by **Relocate chroot-ng out of
+    the guest ET_EXEC range** below, which links chroot-ng at `0x1000000000`
+    instead of making the loader self-relocate.
   - Final protections are applied per host page as the union of every segment
     touching it (RWX where text and data share a page). The counterexample is
     a 4 KiB-max-page-size object on a 16 KiB kernel — Android's 16 KiB
@@ -231,8 +232,11 @@ vfork/`posix_spawn` child-stack handling.
     rewritten svc sites; the seccomp tier covers it on devices).
   - Accepted divergences (deliberate, documented):
     `readlink("/proc/self/fd/N")` on a link-opened fd can show the store path
-    when the guest has a live `/proc`; `ln -P` of a symlink copies the
-    target's contents instead of linking the symlink itself; the marker
+    when the guest has a live `/proc`; `ln -P` of a symlink makes a second
+    symlink with the same text and times, each counting 1 link, not 2 (a
+    symlink cannot be a group's data file: a relative text would be read
+    against the store), and one whose text is in the `.l2s.` grammar is
+    refused `EPERM`; the marker
     read-modify-write is not atomic under concurrent link/unlink; a guest
     cannot create files matching the `.l2s.` name grammar, nor (M60) a
     symlink whose target's last component matches it (denied `ENOENT`);
@@ -241,7 +245,9 @@ vfork/`posix_spawn` child-stack handling.
     group whose surviving names were all mv'ed away leaves its old dir
     non-rmdir'able, and per-dir-fallback links don't survive a rootfs move
     (store links self-heal); `/.l2s` stays reachable via dirfd `..`-walks;
-    cross-dir + EXDEV still copies; an emulated cross-filesystem link (bind
+    cross-dir + EXDEV still copies a regular file (a FIFO, socket or device
+    node, which is otherwise grouped like one, is refused `EPERM` there,
+    never opened); an emulated cross-filesystem link (bind
     mount) *succeeds* where a real one would report `EXDEV` — except out of
     a `:ro` bind, which is `EXDEV` as it is natively (M65).
 
@@ -2911,23 +2917,24 @@ vfork/`posix_spawn` child-stack handling.
   ahead beside them — old threads running the old program through the fd
   cleanup, the signal reset and the mapping reclaim — without a word, since a
   full table read the same as a complete one. A thread a sibling cloned
-  between being listed and taking its request was missed the same way, at
-  any thread count. The listing is the kernel's own now, read afresh every
-  round until it is empty, and every listed sibling is told again each round
-  (a request already pending is not queued twice, and the answer doubles as
-  the existence probe — which also reaches a thread that took over the tid
-  of one that died); a listing that takes more than one read can skip an
-  entry while threads exit under it, so the kernel's own count (`Threads:`)
-  has the last word. What cannot take the request — a zombie, or a thread
-  that keeps `SIGSYS` blocked: qemu-user's own, or a guest that edited its
-  signal frame — is given up on after a second as before, kept apart in a
-  small table that grows, and looked at again once a second; a blocked
-  thread is sampled ten times a millisecond apart first, so a writer of ours
-  holding every signal off for a moment is not mistaken for one. The status
-  fields are read by streaming the file: a `Groups:` line of a process with
-  many supplementary groups runs past any one buffer, and every field wanted
-  comes after it. `tests/guests/spawnexec.c` execs from 4500 parked threads
-  and from sixteen chains that clone their successor at birth; the old
+  between being listed and taking its request was missed the same way, at any
+  thread count. The listing is the kernel's own now, read afresh every round
+  until it is empty, and every listed sibling is told again each round (a
+  request already pending is not queued twice, and the answer doubles as the
+  existence probe — which also reaches a thread that took over the tid of one
+  that died; once a second since M89, which found that a request already
+  delivered is no protection); a listing that takes more than one read can
+  skip an entry while threads exit under it, so the kernel's own count
+  (`Threads:`) has the last word. What cannot take the request — a zombie, or
+  a thread that keeps `SIGSYS` blocked: qemu-user's own, or a guest that
+  edited its signal frame — is given up on after a second as before, kept
+  apart in a small table that grows, and looked at again once a second; a
+  blocked thread is sampled ten times a millisecond apart first, so a writer
+  of ours holding every signal off for a moment is not mistaken for one. The
+  status fields are read by streaming the file: a `Groups:` line of a process
+  with many supplementary groups runs past any one buffer, and every field
+  wanted comes after it. `tests/guests/spawnexec.c` execs from 4500 parked
+  threads and from sixteen chains that clone their successor at birth; the old
   binary reports 407 and ~20 threads after the exec, the kernel and the fix
   report 2 (qemu-user's own thread included) — the `m6` legs.
 
@@ -3141,6 +3148,21 @@ vfork/`posix_spawn` child-stack handling.
   0777 directory on the name, a symlink on it, and a 0777 non-sticky
   candidate are each passed over for the next candidate (all three were
   adopted by the previous build).
+  - Later: the degraded answer was silent, and an Android app hit it
+    without any squatter. AndroidTerm hands chroot-ng its `files`
+    directory as `$TMPDIR`, which the framework makes 0771, and on a device
+    `/data/local/tmp` and `/tmp` are the shell user's, so every candidate
+    was passed over and the guest's `shm_open` failed `ENOENT` while the
+    same rootfs under Termux (a 1777 `$PREFIX/tmp`) had its `/dev/shm`. A
+    launch that ends up with no stand-in now warns on the way in, naming
+    each candidate and why it was passed over (`shm_parent_safe` became
+    `tmp_parent_unsafe`, which returns the reason), and says how to fix
+    `$TMPDIR`. `CNG_DEVSHM_FORCE_TMP` now leaves the guest no `/dev/shm`
+    when the stand-in fails, as a device does, instead of falling back to
+    the host's, and `CNG_TMP_ENV_ONLY=1` drops the two fixed candidates so
+    a host whose `/tmp` would serve can take that path. m14 legs: a 0771
+    `$TMPDIR` leaves no `/dev/shm` and warns with its reason, a 1777 one
+    holds the stand-in and warns about nothing.
 
 - [x] **M62 — an emulated netlink slot judged stale was claimed from its next occupant**
   The table of emulated `NETLINK_ROUTE` sockets retires a slot lazily — close
@@ -3531,14 +3553,15 @@ vfork/`posix_spawn` child-stack handling.
 
 - [x] **M77 — under -R a thread that freed its own stack killed the process**
   Found behind M76: with the JVM past its startup probe, `java` under -R died
-  of a SEGV as soon as its first thread ended. musl's `__unmapself` and bionic's
-  `_exit_with_stack_teardown` end a detached thread with an `munmap` of the
-  stack it is standing on and an `exit` (`mov x8,#215; svc 0; [mov x0,#0;]
-  mov x8,#93; svc 0`), and every detached thread of those libcs takes that
-  road — the JVM's all are. The rewriter replaced both `svc` with branches to
-  trampolines, and a trampoline builds its frame on the caller's stack and reads
-  every register back from it, so the thread returned from the munmap to a
-  frame that was gone. The default action of that SEGV takes the whole process.
+  of a SEGV as soon as its first thread ended. musl's `__unmapself` and
+  bionic's `_exit_with_stack_teardown` end a detached thread with an `munmap`
+  of the stack it is standing on and an `exit` (`mov x8,#215; svc 0; [mov
+  x0,#0;] mov x8,#93; svc 0`, bionic's with w8 — matched only since M90), and
+  every detached thread of those libcs takes that road — the JVM's all are.
+  The rewriter replaced both `svc` with branches to trampolines, and a
+  trampoline builds its frame on the caller's stack and reads every register
+  back from it, so the thread returned from the munmap to a frame that was
+  gone. The default action of that SEGV takes the whole process.
   - `scan()` leaves the pair alone: the munmap is told from any other by an
     exit two or three words on, and the exit by an munmap two or three words
     before it (`stack_teardown`), so a program's ordinary calls are rewritten as
@@ -3704,6 +3727,1110 @@ vfork/`posix_spawn` child-stack handling.
     the first one's table. The previous build hangs in every run. An interval
     timer was the first try, and it starved the loop wherever a read takes
     longer than the interval — natively on a TCG VM, with no chroot-ng at all.
+
+- [x] **M82 — `-l` reads and keeps the hardlink groups proot made**
+  A rootfs installed through proot-distro holds its hardlinks the way proot's
+  link2symlink wrote them: every name a symlink holding the HOST path of an
+  indirection symlink `.l2s.<name><NNNN>` in proot's l2s directory
+  (proot-distro's `PROOT_L2S_DIR` is `<rootfs>/.l2s`, the same as the store;
+  without it, beside the first name), which names the data file beside it,
+  `<indirection>.<CCCC>`, CCCC the live count. The guest-level walk re-rooted
+  those host paths, so every name dangled into `<rootfs><rootfs>/.l2s`: cat,
+  exec and stat failed and `rm` left the count where it was. arm64chroot gained
+  the same support in its `bddbec9`, and the owner chose full bookkeeping over
+  a read-only presentation.
+  - Read: `cng_l2s_resolve` recognizes a member when the whole chain checks
+    out and presents it as the data file with that count, so every caller —
+    stat/statx/fstat, getdents' `d_type`/`d_ino`, `readlink` (EINVAL), the
+    no-follow calls, exec's own name, the same-file rename — treats it as one
+    of the emulation's own names. The walker maps the host paths (members and
+    indirections, `cng_l2s_untranslate_target`) into the guest view, and the
+    indirection that sits in plain sight in proot's per-directory layout reads
+    back as the guest path of its data file.
+  - Kept: a link of a member (or of the data file a followed link reaches) is
+    a member with the same text after the count went up; an unlink, or a
+    rename over a member, takes it down; the last removes the data and the
+    indirection. A count change is proot's two renames — the data file to its
+    new count, the indirection repointed by a symlink renamed over it — under
+    the store lock; a reader that finds the data missing looks again a few
+    times, and a chain a killed process left cut is mended by the next change
+    (the one data file of that name, found by a scan). New groups are still
+    made in chroot-ng's scheme, which proot does not read.
+  - Contained: a member's text is placed as the emulation's own targets are (a
+    canonical path in a place of the guest's own, or a stale store path healed
+    onto this rootfs's store, which a moved tree's texts are; both texts are
+    then rewritten to the current path). Of the indirection's text only the
+    basename is used, `<indirection>.<CCCC>`, and the data file is taken beside
+    the indirection; anything else is an ordinary symlink. The two-step
+    first-link fallback no longer renames over an entry it did not make: an
+    indirection of proot's for a file named by digits spells a data name of
+    chroot-ng's.
+  - Not covered: proot takes no lock, so proot and chroot-ng changing one group
+    at the same moment can still end a count one off; a name added or removed
+    while another process opens a different name of the group can fail that
+    open for the length of the two renames (as under proot); and a member of a
+    cut chain answers as the dangling symlink proot shows (stat ENOENT) until
+    a change of the group mends it.
+  - Tests: `-t l2stest`'s `l2s-proot` (presentation incl. fstat, `d_type` and
+    the indirection's readlink, link/followed link/unlink/rename bookkeeping
+    on the host, a moved tree, the per-directory layout, a cut chain mended,
+    two hostile chains), and an M10 differential: the same script over real
+    hardlinks and over proot's layout laid down by hand must print the same
+    bytes — including busybox run through a member — and the store must then
+    hold what proot itself would leave. The previous build fails both.
+
+- [x] **M83 — the l2s store lock waited on itself**
+  Every change of a group's count is made under one exclusive flock per
+  rootfs (`.l2s/.lock`), held across the several syscalls the change takes.
+  Two ways it could never be had again, both found while M82 added callers:
+  - A signal. On the `-R` tier the dispatcher runs on the guest's own mask, so
+    a handler was delivered on the way out of any syscall a change makes, and a
+    handler that linked or unlinked a name of a group opened the lock file
+    again and waited for the lock its own thread held — forever, since an
+    flock belongs to the open file and the second open is another one (the
+    guest thread sat in `locks_lock_inode_wait`). The lock is now held with
+    every signal blocked, as the view's, the credentials' and M81's mount
+    snapshot already are; a signal that arrives meanwhile is taken once the
+    change is done.
+  - A fork. A fork by another thread while the lock was held handed the child
+    a duplicate of the locked open file, and the close that gave the lock back
+    left it held by the child's copy: every later change, by any process,
+    waited until that child exec'd or exited. The lock is given back with
+    `LOCK_UN` before the close.
+  - Tests: `tests/guests/l2ssig.c` (M10, `-R -l`) links and unlinks a name in a
+    loop under a one-shot timer, swept as `mntsig.c` sweeps its own, whose
+    handler does the same; the previous build hangs. `tests/guests/l2sfork.c`
+    (M10) forks children that do not exec beside a loop of links; the previous
+    build held a link up for the child's whole life (8 s against 38 ms with
+    real hardlinks).
+
+- [x] **M84 — the uid and gid setters without `-u`**
+  Android's app filter refuses every uid and gid setter but `setresuid`
+  (bionic's `SECCOMP_BLOCKLIST_APP.TXT`: `setuid setgid setreuid setregid
+  setresgid setfsuid setfsgid setgroups`; `capset` is allowed). Its trap reached
+  the credential handler, which answered all of them ENOSYS, and so did every
+  setter under `-R` on any host, where nothing refuses them: `-R` rewrites every
+  `svc` site, and the handler took any setter it saw without `--fake-id` for a
+  refused one. `setgid(getgid())` — how many a program drops a set-id bit it
+  may have been started with — failed outright, and `setfsuid` answered 0.
+  - The probe now measures the credential family. A setter the host allows is
+    re-issued; one it refuses is answered the way the kernel would answer this
+    process, by the rules the fake set runs, applied to the real ids and to
+    `CAP_SETUID`/`CAP_SETGID` (no longer euid 0, for this set): EINVAL for an
+    id of -1, EPERM for a change, and 0 for a call that changes nothing.
+    `setgroups` without the capability is EPERM before its size or pointer is
+    looked at (measured on the host kernel; qemu-user checks both itself
+    first). `setfsuid`/`setfsgid` answer the current id.
+  - Divergence: a change the rules allow — which takes the capability, or ids
+    that differ, and an app's process has neither — is EPERM, since the one
+    call that could make it is the one refused (said once on stderr, like any
+    other refusal). No setter is translated into an allowed one.
+  - `CNG_SETID_DENY=1` takes the eight as refused on any host: marked after the
+    probe and trapped by our own filter, as Android's would deliver them.
+  - Tests: `-t blocktest`'s `setid` rows (each through a trap and through `-R`,
+    refused and as measured; the previous build answers -38 to all 64), and
+    `tests/guests/setid.c` in M9 on every tier the host has, with and without
+    the knob, against a kernel's own text (libc's setxid broadcast to a second
+    thread included). nettest's default-branch leg used `setgid` as its
+    blocked syscall, which never reached that branch; it uses
+    `get_robust_list` now.
+
+- [x] **M85 — a signal reached a process the view hides**
+  M46 left the signal family native on purpose (a real chroot lets a
+  same-uid process be signalled, and trapping `kill` costs every guest). By
+  the owner's decision it is now part of the view. `/proc` hid a host process
+  by path, but `kill` named it by pid and reached it all the same. The group
+  and broadcast forms named host processes the guest never saw:
+  - a guest's `kill(0)` (`trap 'kill 0' EXIT`) signalled the shell or
+    pipeline that started chroot-ng, because they share its process group;
+  - `kill(-1)` (a shutdown script, `killall5`) signalled every process of the
+    user, which on a device includes the terminal app the guest runs in.
+  - `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo` are
+    trapped for every guest while there is a view and a registry. A hidden
+    target is ESRCH, as `/proc/<pid>` is. The call is re-issued at a pid
+    above `PID_MAX_LIMIT`, so whatever the kernel checks before its lookup
+    keeps its own answer: a forged `si_code` is EPERM and a zero tid is
+    EINVAL. The thread-directed calls are judged by the thread group they
+    name, since the kernel delivers only within it, so `raise` and
+    `pthread_kill` cost no lookup. The registry now also checks one of the
+    guest's own threads with a single `tgkill` probe instead of reading its
+    status file.
+  - The group and broadcast forms signal each process the view shows in
+    turn, and combine the results the way the kernel's
+    `kill_something_info` does: 0 if any member took the signal, ESRCH for
+    an empty group, and for `kill(-1)` every process except pid 1 and the
+    caller. The caller goes last, because its own SIGKILL or SIGSTOP would
+    stop the rest from being sent. A tracee's stop signal is routed per
+    member, as for a single pid.
+  - Divergence: the kernel's group kill is atomic and catches a child that
+    is still being forked; this one passes over the registry again until a
+    pass finds nobody new. A child whose parent has not yet published it
+    when the last pass ends is missed.
+  - The parent of the first guest process is a host process and is hidden
+    like any other (owner's choice). A guest can no longer signal a host
+    launcher, as in Xorg's SIGUSR1 to xinit.
+  - The family runs native under `--no-proc` and without a registry
+    (`CNG_PROCREG_NONE`). Without one, every other pid would look hidden and
+    a shell could not signal its own jobs. `pidfd_send_signal` stays native,
+    because `pidfd_open` only gives a pidfd for a process the view shows.
+  - Tests: `-t bpftest`'s `hidden-pid signals` row. In M25,
+    `tests/guests/sigview.c` runs against two host `sigholder` processes,
+    one in the guest's group and one leading its own; each counts the
+    SIGURGs that reach it. Every call, the parent, and the group and
+    broadcast forms are checked on each tier the host has. A `--no-proc`
+    control shows the holders do see a signal that reaches them, and a
+    no-registry run shows the guest still signals its own processes. The
+    previous build delivers 6 and 2 SIGURGs to the holders.
+
+- [x] **M86 — an attach that reached a new process before its fork hooks was lost under -R**
+  M18's `ptrace waitnowait` leg failed about one run in a hundred on the dev
+  host, and two to four on the device, as "usr1 odd: killed 9". Its tracer
+  attaches to a grandchild whose pid the middle process hands over as soon
+  as its fork returns. On the `-R` tier the converted clone's child-side
+  hooks ran on the guest's own signal mask, so the attach kick could be
+  handled in the child on the way out of the clone, ahead of them. The child
+  attached, reported its attach stop and was resumed. Then
+  `cng_pt_fork_child` cleared the per-task table the attach had been recorded
+  in (it describes the parent's threads) and the traced count with it. The
+  tracee kept our signal hooks with nothing behind them: its SIGUSR1 went
+  straight to its own handler with no stop, its exit was never published, and
+  the tracer, finding a zombie it is not the parent of, reported it killed by
+  SIGKILL. The SIGSYS tier was never exposed: its handler masks every signal
+  but SIGSYS.
+  - `cng_clone_convert` blocks every signal but SIGSYS from before the clone
+    until each side is done with it, which is the SIGSYS tier's mask, and
+    each side then puts the guest's mask back. A signal sent meanwhile is
+    taken at that point. SIGSYS stays open for the gate-net, as in the
+    handler.
+  - Test: `-t ptracetest`'s `fork kick` rows (m18). A test aid,
+    `cng_g_fork_child_probe`, parks the child in that window until the
+    tracer's `PTRACE_ATTACH` has queued the kick. The tracee must then stop
+    for the attach and again for its own SIGUSR1. The previous build lets the
+    SIGUSR1 kill it, every run. The waitnowait leg went from 20 failures in
+    2000 runs to none of this kind in 3000.
+
+- [x] **M87 — a process forked before its parent was published stayed invisible**
+  The parent publishes a child into the process registry once its clone
+  returns, and the scheduler need not run it again before the child is well
+  into guest code. A child that forked in that gap found no entry of its own
+  for `cng_procreg_fork` to copy, so its own child was never published at
+  all: invisible in `/proc`, ESRCH to `PTRACE_ATTACH`, and since M85 hidden
+  from `kill`. That was the other `ptrace waitnowait` failure, about one run
+  in 3000 on the dev host: the attach failed, the cleanup kill could not reach
+  the grandchild, and it spun forever holding the test's output pipe.
+  - The child waits for its parent's copy before it runs any guest code:
+    yielding first, then in 1 ms naps up to about a tenth of a second. If
+    the parent does not come through (it is gone, stopped for longer than
+    that, or the registry had no slot to give), the child copies the parent's
+    entry itself. A parent with no entry of its own is not waited for at all.
+    Both halves always writing was the alternative, and they would each claim
+    a free slot as often as not and leave the process holding two. The
+    parent's copy now checks the stamp again under the slot lock, so it
+    cannot overwrite an exec the child published in between.
+  - Cost: the parent's `fork()` is unchanged. The child runs its first
+    instruction about 0.23 ms later under qemu-user (1.04 to 1.27 ms): its
+    own starttime read, and the parent's publish it now waits out. A forker
+    with no entry is recognized from its slot alone, with no `/proc` read.
+  - Test: `-t proctest` leg 3c (m11). A second test aid,
+    `cng_g_fork_parent_probe`, holds the parent before its publish until the
+    child has forked and looked its own child up. The previous build leaves
+    the child with no entry, every run. With M86, the waitnowait leg passed
+    4000 runs out of 4000.
+
+- [x] **M88 — every wait under -R polled the ptrace registry, traced or not**
+  The SIGSYS tier traps `wait4`/`waitid` only on a tracer, but every
+  rewritten site reaches the dispatcher, which sent each one to the
+  registry-aware wait. That wait polls in 50 ms slices: a non-blocking host
+  wait, then a futex sleep that only a tracee's stop or exit cuts short.
+  Nothing traced means nothing cuts it short, so a child's exit was seen up
+  to 50 ms late. Under qemu-user a fork, `_exit` and `waitpid` took 51.6 ms
+  under `-R` against 0.74 ms without it, and every shell pipeline paid that
+  per command. The loop also swallowed EINTR: a signal handler without
+  SA_RESTART that ran during the wait did not end it, as the kernel's does.
+  - A process that has never been a tracer, and that nothing in the registry
+    names as one, waits in the kernel (`cng_pt_wait_native`): the guest's
+    call as it issued it, on its own mask. The process-wide `g_pt_tracer` is
+    set by `cng_pt_arm_tracer`, as permanent as the SIGSYS tier's tracer
+    filter, and cleared by a fork, whose child traces nothing.
+  - What has to work is letting go. A child's `PTRACE_TRACEME` makes its
+    parent a tracer while the parent may be asleep in that wait, and only
+    the kick it sends can end the wait. So the blocking wait goes through a
+    stub in the gate (`cng_wait_unless`). The stub makes the svc only while a
+    count of kicks taken still holds the value read before the registry was
+    looked at. The kick handler (`cng_pt_kick_taken`) sends a thread
+    interrupted between that compare and the svc, or at the svc with a
+    restart pending, to the stub's bail. It turns an -EINTR its kick
+    inflicted on the svc into the same answer, `CNG_WAIT_KICKED`. The wait
+    then looks again, and a tracer by now goes to the registry. A guest's own
+    EINTR is still the guest's.
+  - Other threads: becoming a tracer kicks every other thread when any of
+    them is in such a wait, on either tier. `PTRACE_TRACEME` kicks its
+    parent process-directed, so a parent whose main thread blocks the kick
+    is still reached. A kick that landed while a guest handler ran on top of
+    the wait, which the kernel then restarted, is missed. The tracee's
+    re-kick every 500 ms of an uncollected stop now carries its own magic
+    (`CNG_PT_KICK_REWAKE`), and a tracer with a thread still in a native wait
+    forwards it to its threads.
+  - The registry-aware wait stays for a tracer, a wait with the kick blocked,
+    and a session whose kick signal could not be delivered at startup
+    (`cng_g_kick_live`). Without a registry (`--no-ptrace`) the wait is the
+    kernel's outright; before, it spun, since there was no futex to sleep on.
+  - Cost: under qemu-user a fork, `_exit` and `waitpid` round trip is 2.0 ms
+    under `-R`, against 51.6 ms before. A blocking wait costs one more syscall
+    (the mask read), and a non-blocking one none.
+  - Test: `-t ptracetest`'s `native wait` rows (m18). They check the kick
+    handler on synthesized frames inside the stub. A test aid,
+    `cng_g_wait_native_probe`, takes a kick between the look at the registry
+    and the svc, which must not be slept through. A child's `PTRACE_TRACEME`
+    while its parent sleeps in the kernel's wait must hand the wait to the
+    registry, which then reports the stop and the exit. A tracer's fork must
+    wait natively again. In m8, the `waitintr` guest is checked against the
+    kernel: waitpid and waitid interrupted with and without SA_RESTART, and
+    uninterrupted. The previous build returns the child, 5 s later, where the
+    kernel returns EINTR.
+
+- [x] **M89 — an exec's de_thread stacked its requests on a thread that had not run**
+  M6's chain shape (sixteen chains of short-lived detached threads, then an
+  exec) died of a SIGSEGV in a few runs in a hundred on Android 8 (Galaxy S7,
+  kernel 3.18). Traced, it was two races, both ending in a signal frame the
+  kernel had nowhere to put, which kills the whole process (`SI_KERNEL`).
+  - Told every round: M52 sent the die request to every listed sibling each
+    100 µs round, trusting that a pending request is not queued twice. A
+    request already delivered is no longer pending, so the next is
+    delivered on top of it. A thread the scheduler left at the handler's first
+    instruction took a frame a round, 4.6 KiB each on the alternate stack the
+    handler runs on (bionic's is 16 KiB), and the fourth did not fit. Each
+    sibling is now told once, in a bitmap by tid that is forgotten once a
+    second (a tid a new thread took over), and only looked for with a
+    signal-0 `tgkill` in between. A request lost to a SIGSYS already pending
+    (a trap's) is not lost any more: while an exec kills its siblings, any
+    SIGSYS a sibling takes is taken for the request
+    (`cng_dethread_doomed`).
+  - Told during the unmap: a thread on its way out blocks every signal, unmaps
+    its own stack and exits, and is left alone while its mask says so (the
+    grace of 79e5c2a). The exec read the mask, the thread then set it and
+    entered the unmap, and the request sent microseconds after the read was
+    delivered as the unmap returned. The mask is now stored before the thread
+    looks for an exec in progress, and the exec says it is one before it reads
+    any mask, all four sequentially consistent: a thread whose mask was read
+    too early sees the exec and exits in `cng_sig_note_mask`. Past the 100-round
+    grace such a thread is still left alone while it is running or runnable
+    (not asleep in a syscall), for up to a second.
+  - Test: `tests/guests/dtstall.c` runs the chain shape under ptrace and holds
+    each request at its delivery for 2 ms, as a loaded scheduler does. The
+    previous build died 10 runs in 10 on the S7 and 5 in 5 on the arm64 VM,
+    and this one passes every run. It needs a host that runs the guest's
+    binaries itself, so it is skipped under qemu-user. The plain chain leg
+    crashed 2 runs in 30 on the S7 before (9 in 100 with the first half of
+    this alone) and none in 400 after.
+
+- [x] **M90 — bionic's stack teardown was rewritten after all**
+  M77 leaves alone the `svc` pair a detached thread frees its own stack with,
+  recognising each by the `mov x8, #nr` before it. bionic writes the number
+  into w8 (`mov w8, #215` and `mov w8, #93`, on Android 8 and 15 alike), so its
+  `_exit_with_stack_teardown` was rewritten like any other site wherever its
+  code is rewritten ahead of time (a static bionic program, or a library
+  copied because its file may not be mapped executable), and every detached
+  thread then died of a SEGV on its way out. The match ignores the width bit
+  now. `unmapself.c` wrote bionic's sequence with x8, which is how it passed;
+  it writes w8 now, and the previous rewriter fails it.
+
+- [x] **M91 — a fake identity's own credentials were refused over AF_UNIX**
+  GLib's GDBus client sends an `SCM_CREDENTIALS` record before it
+  authenticates, claiming its `getpid()`, `geteuid()` and `getegid()`. Under
+  `-u` those are the fake ids, and the kernel holds a sender to the ids it
+  claims (`scm_check_creds`, against the real ones), so it answered EPERM: an
+  XFCE session started with `dbus-launch` on Termux showed "Unable to contact
+  settings server" ("Error sending credentials: Error sending message:
+  Operation not permitted"). proot rewrites the claim to the real ids; a
+  receiver there still sees the real ones.
+  - Going out (`sendmsg`, and `sendmmsg` per message), the claim is judged
+    against the fake set by the kernel's rule (the real, effective or saved id;
+    any id while fake root) and spelled in the host's ids. A claim the rule
+    refuses is sent with pid 0, so the kernel refuses it with its own EPERM, in
+    its own order among the records. An id of -1 and a record of the wrong
+    length go through as they are, for the kernel's EINVAL.
+  - Coming in (`recvmsg`, `recvmmsg`), the ids are remapped as `SO_PEERCRED`'s
+    are, in the monitor's bounce buffer before the copy to the guest, and so is
+    a record cut short as far as its whole ids go. AF_NETLINK's control data
+    is bounced for this too under `-u`.
+  - What cannot be done: the host's ids do not say which fake id a claim named,
+    so a receiver sees the run's identity for every claim the rule allowed (as
+    `SO_PEERCRED` does; superseded by M102, where the sender records its claim
+    in the registry). A fake root cannot name another pid, since the host
+    grants it no CAP_SYS_ADMIN. Where chroot-ng itself runs as root, a refused
+    claim is ESRCH instead of EPERM.
+  - Test: m7, `tests/guests/scmcred.c`, on both tiers as fake root, as fake
+    1234 and without `-u`, against the kernel's own answers. The previous build
+    fails the 15 rows a claim or a remap decides. qemu-user drops MSG_CTRUNC
+    from a cut record, so the flag is checked natively only.
+
+- [x] **M92 — a refused read-only reopen of a memfd was served writable**
+  Chrome 156 makes every shared-memory region with `memfd_create` and takes
+  its read-only half with `open("/proc/self/fd/N", O_RDONLY)`; before that half
+  goes to another process it CHECKs with `F_GETFL` that it is read-only
+  (`PlatformSharedMemoryRegion::Take`). Android's policy refuses an app the
+  reopen, and `cng_fd_reopen` answered the refusal with a duplicate of the
+  descriptor it held — O_RDWR, as `memfd_create` makes it — so the browser died
+  of the CHECK (SIGTRAP, `brk #0`) as it started on Termux. Under proot the
+  refusal reaches Chrome, which falls back to a file under /dev/shm.
+  - A duplicate is the open's answer only where its access mode is the one
+    asked for. A narrower open keeps the host's refusal, except for the script
+    a `#!` exec ran from that descriptor, opened O_RDONLY: its interpreter only
+    reads it, and that is the apk 3 package-script case the duplicate was made
+    for. The exec's commit records the script by number and identity
+    (`cng_fd_reopen_script`), so a number since handed to another file is not
+    it.
+  - Test: `fd_reopen` in faketest (the refusal, the script, the same mode, a
+    script's number reused), and m7's `tests/guests/memfdro.c` on both tiers: a
+    read-only reopen is read-only or refused, never writable; a same-mode one
+    reads from the start; a script runs from one by either exec spelling; a
+    close-on-exec one is gone for its interpreter. The previous build fails 5
+    of those on the device (its "read-only" duplicate let the test write into
+    the memfd).
+
+- [x] **M93 — an image moved with MREMAP_DONTUNMAP read back zeroes**
+  The loader's anonymous strategy copies an image in where a kernel exec maps
+  it from the file, and `mremap(MREMAP_DONTUNMAP)` tells the two apart: the old
+  range stays mapped, and its next touch faults in the file's bytes for a file
+  mapping, zero-fill for anonymous memory. V8 moves its embedded builtins out
+  of the text of the binary that carries them that way, then CHECKs the first
+  word at both addresses (`OS::RemapPages`), and every Chrome renderer and
+  utility process died of it. `-F`, which maps the image from the file, was
+  not affected.
+  - The loader records the pages it filled from the file (`cng_loaded.copied`,
+    one range per PT_LOAD with a file part) and the generation entering
+    publishes them (`cng_execmap_images`). The filter traps mremap only with the
+    flag; a move out of a copy is the kernel's, and the old range then gets back
+    the bytes that moved, written through /proc/self/mem
+    (`cng_execmap_dontunmap`), which takes the range's own protection as it is.
+  - Where the kernel moves no file mapping this way (5.7–5.12 refuse all but
+    private anonymous memory) or /proc/self/mem cannot be written, both probed
+    once, the guest is told EINVAL, as it would be for the file mapping.
+  - Limits: a page the guest wrote reads back as written where the kernel would
+    refault the file's bytes (which keeps -R's rewritten sites); a range moved
+    once is not recorded again; a guest that unmaps part of its own image
+    leaves a stale record (munmap is not trapped); the copies execmap makes of
+    a guest's own mmaps are not recorded.
+  - Test: m23's `tests/guests/dontunmap.c` against the kernel's own move of a
+    private mapping of the same program's file, on -R, seccomp and -F, with
+    anonymous memory still reading back zeroed; bpftest checks that only the
+    flag traps.
+
+- [x] **M94 — synthesized /proc files were writable on Android**
+  A synthesized view is a memfd made read-only by reopening it through its own
+  link (`synth_seal`), and Android's policy refuses that reopen, so the guest
+  was handed an O_RDWR /proc file. Chrome dup()s the `/proc/<pid>/status` of
+  each child it starts and CHECKs that what it hands on is read-only; the
+  browser died of that next.
+  - Where the reopen is refused (asked once per process), the view is copied
+    into a file in a private per-uid directory under the temp directory
+    (`cng_private_tmp_dir`: the /dev/shm stand-in's search, now shared), opened
+    O_RDONLY for real, and unlinked before the guest sees it. The file carries
+    the view's name as the memfd does —
+    `<dir>/cng-proc.<pid>.<n>:<name, %-escaped> (deleted)` — so the fd links,
+    the stat family and statfs find the real file the same way; their first
+    cuts take an unlinked file on the directory's device (or filesystem) beside
+    a memfd. The refresh reopens it O_RDWR through its link, which an app may
+    do on /data. A link names the view before it is untranslated, since on
+    Termux the directory is inside a -b bind of $PREFIX/tmp.
+  - The refresh table knew a view by device and inode, and a memfd's inode
+    number only goes up; ext4 hands a freed one to the very next file, so an
+    uptime view opened onto a closed loadavg view's number matched its entry
+    and was rewritten as loadavg (proctest's reused-by-another-kind check, on
+    the VM). A file of ours is also known by the pid and counter in its name.
+  - Two threads reading one view at once both rewrite it with the clock each
+    read, and the later write won whichever clock was older. On a file, a
+    rewrite held up behind the other's inode lock made that real: m11's
+    procrace lost a refresh in about one run in four on the device. A rewrite
+    through a description of ours now holds that description's flock across
+    the clock and the write — non-blocking, with a bounded wait, since a guest
+    may flock its own description and a fork can leave the child holding ours.
+  - `CNG_PROCFS_REOPEN_DENY=1` takes the reopen as refused anywhere.
+  - Test: m11 runs proctest a second time with the knob and a fresh $TMPDIR:
+    every check holds, the fd is read-only for real, its link names the view,
+    and the directory is empty afterwards. On the device the read-only check,
+    skipped until now, runs.
+  With M92–M94, `google-chrome --no-sandbox` starts under `-u` on Termux
+  (headless: `--dump-dom` of a page, exit 0).
+
+- [x] **M95 — a netlink request written with write(2) was never answered**
+  Firefox 158 on Termux loaded pages over HTTP/1 and HTTP/2 and hung for good
+  on the first site offering HTTP/3 (example.com: Cloudflare). Its socket thread
+  sat in `read(2)` on an emulated rtnetlink socket: Mozilla's `mtu` crate, which
+  neqo asks for the path MTU of each connection, `write(2)`s an RTM_GETROUTE and
+  `read(2)`s the reply, then the same for RTM_GETLINK. The seccomp tier traps
+  neither, and a request was served only at the next *trapped* call on its socket
+  — M16 listed a `write()`+`poll()` client as a known limitation; under `-R`
+  dispatch's read case drained the queue, which is why the suite (every M16 leg
+  runs under `-R`) never saw the plain read.
+  - The far end of each emulated socket is now the **broker daemon's** (owner's
+    choice over a reserved high-fd range with read/write trapped, an async
+    signal, and the status quo): the daemon polls it and serves each request the
+    moment it arrives, by whatever route — the kernel's netlink answers inside the
+    `sendmsg`. `socket(2)` registers the daemon's end (`CNG_REQ_NLSOCK`, the fd
+    over SCM_RIGHTS, the opener's test aids as flags); a trapped send
+    (send/sendto/sendmsg/sendmmsg) is re-issued into the pair with MSG_NOSIGNAL
+    and then waits for the daemon (`CNG_REQ_NLSYNC`), so its replies are queued
+    when it returns; a receive, or an `-R` read, that would not wait and finds
+    nothing asks the daemon to finish and looks once more. The port id is the
+    opener's pid, fixed for the socket's life (a fork child is told its
+    parent's), as the daemon stamps it on replies.
+  - The pair is **SOCK_SEQPACKET**, not SOCK_DGRAM: the guest's last close hangs
+    it up, which is how the daemon knows to let go (close is not trapped, and a
+    datagram pair tells its survivor nothing), and it ignores a destination
+    address where the datagram one refused a `sendmmsg` naming the kernel
+    (EINVAL). sendmsg goes in whole — every iovec, where only the first was read
+    — without the address or the control data.
+  - The guest's process holds one descriptor per socket now: the monitor's pair
+    end and the per-request relays (M16's hidden-descriptor history) live in the
+    daemon's table. The daemon holds `CNG_NL_SOCK_MAX` (1024) at once per
+    namespace; past that, and where no daemon can be reached, `socket(2)` gets
+    the host's own answer. Its stderr is /dev/null, so the relayed/synthesized
+    trace comes back in the sync reply and is printed by the guest's side
+    (`nl served fd=N: …`). Broker protocol `cng-ipc.v4`.
+  - Test: `tests/guests/nlrw.c` — `write`+`read` (the crate's whole
+    conversation), `write`+`poll`+`read`, `writev`, `sendmmsg` naming the
+    kernel, each under its own alarm — in m16 under `-R` and, where the filter is
+    live, the seccomp tier, against the kernel where rtnetlink works. The
+    previous build, on the VM: `write: timeout`, `poll: ready=0`,
+    `writev: timeout`, `sendmmsg: sent=-1 err=22` in the seccomp tier. nlchurn's
+    3600 sockets must now each appear in the emulation's trace — past the
+    daemon's 1024 only if every close was noticed (mutation: 1024).
+  Firefox's other failure on the device is not ours: since Bug 2045119
+  (Firefox 158) a child process demands a sealed memfd for every shared-memory
+  handle when it can make one, while the parent, whose read-only reopen of a
+  memfd Android refuses (M92), hands it `/dev/shm` files. proot fails the same
+  way. `MOZ_SHM_NO_SEALS=1` in the guest's environment is the workaround.
+
+- [x] **M96 — the ACK a netlink get asked for never came**
+  The kernel answers a non-dump get with the object — or the error refusing it
+  — and then, when the request carried NLM_F_ACK and was not refused, with an
+  ACK of its own (`netlink_ack`, error 0): an NLMSG_ERROR flagged NLM_F_CAPPED
+  echoing the request's header, its own datagram. A dump is never acked,
+  whatever it asked. The emulation sent the object alone: a relayed get read
+  one datagram off the relay socket and closed it with the kernel's ACK still
+  queued, and a synthesized one (the link Android refuses) never built any. A
+  client that waits for the ACK — libnl's `nl_wait_for_ack` — waited for good.
+  Found reading the relay while moving it into the daemon (M95); the mtu
+  crate sets NLM_F_ACK but stops at the object.
+  - The relay reads the ACK too when the request asked and the answer was not
+    an error, and synthesizes one if the host goes quiet; a synthesized answer
+    is followed by one built the kernel's way (`put_ack`).
+  - A kernel before 4.12 sends its ACK with no flags (Android 8's 3.18,
+    measured), so with the emulation forced there a relayed ACK came through
+    unflagged and a synthesized one flagged, both on one socket. The relay
+    now flags a success ACK as the 6.1 the emulation advertises
+    (`cap_ack`). Only the kernel comparison skips there.
+  - Left as it was: a request the emulation does not model (RTM_NEWADDR, …) is
+    still acked whether or not it asked, and a non-dump RTM_GETROUTE with no
+    relay still gets that ACK alone, the oracle's answers both. That ACK was
+    built unflagged, a pre-4.12 kernel's, on every host. It is `put_ack`'s
+    now, NLM_F_CAPPED and all.
+  - Test: `tests/guests/nlack.c` — getlink and getroute with and without
+    NLM_F_ACK, and a dump asking for one, every message counted; in m16
+    relayed and with CNG_NETLINK_DENY_GETLINK (synthesized), against the
+    kernel where rtnetlink works. The previous build: `acks=0` on both gets.
+    `nlack unmodelled` sends bubblewrap's RTM_NEWADDR, under the emulation
+    only (unprivileged, a kernel answers EPERM and Android refuses the send);
+    the build before had `flags=0`.
+
+- [x] **M97 — `openat2` is emulated where the host cannot issue it**
+  Ubuntu 26.04's tar (1.35 with the CVE-2025-45582 backport) opens the
+  parent of every member it extracts with `openat2(…, "dir/",
+  O_PATH|O_DIRECTORY|O_NOFOLLOW, RESOLVE_BENEATH)`. Android's filter refuses
+  `openat2`, and the dispatcher answered `ENOSYS` as an older kernel would —
+  so every directory came back "Cannot mkdir: Function not implemented" and
+  every file in one "Cannot open", on any archive with a subdirectory.
+  That answer used to be enough: gnulib's `openat2` falls back to its own
+  emulation on `ENOSYS`. But glibc 2.43 put an `openat2` wrapper in front of
+  the raw call, gnulib is no longer built where libc has one, and the tar
+  binary imports `openat2@GLIBC_2.43` — so it would fail the same way natively
+  on any pre-5.6 kernel (the 3.18 and 4.19 devices).
+  - Most of the call was already ours: M24 answers `NO_SYMLINKS`,
+    `NO_MAGICLINKS` and `NO_XDEV` in the walk, and walks `BENEATH` /
+    `IN_ROOT` wherever a bind or zone sits under the dirfd. The kernel was
+    left three things: judging the `open_how`, the scoped resolution where
+    nothing sits under the dirfd, and the open itself.
+  - Where `openat2` cannot be issued — refused by the filter (`cng_blocked`),
+    or `ENOSYS` from a pre-5.6 kernel or qemu-user, asked once and remembered
+    (`openat2_absent`) — those three are done here: `how_validate` is
+    `build_open_flags()` as `openat2` runs it (unknown flag or resolve bits, a
+    mode without `O_CREAT`/`O_TMPFILE` or outside 07777, `O_PATH` with anything
+    but its companions, `BENEATH` with `IN_ROOT`, O_TMPFILE's own rules, and
+    `EAGAIN` for a create, truncate or O_TMPFILE under `RESOLVE_CACHED`); every
+    scope is walked; and what is left is re-issued as the `openat` it then is
+    — pinned, like every other re-issue. Any other `RESOLVE_CACHED` lookup is
+    made the ordinary way, which is what a warm cache answers.
+  - A scope whose dirfd has no guest name is answered as `path_init()`
+    answers it: `EXDEV` for an absolute name under `BENEATH` before the
+    descriptor is looked at, then `EBADF` / `ENOTDIR`, and `EACCES` for a
+    directory from outside the view, as every other route refuses it.
+  - `CNG_OPENAT2_DENY=1` takes `openat2` as refused on any host.
+  - Test: `tests/guests/openat2.c` gained 21 cases — the validation, the
+    scope's own errors, and tar's opens (the parent with a trailing slash, a
+    create under it, and a planted absolute or climbing symlink, both
+    `EXDEV`) — and turns a filter's SIGSYS into the "unsupported" a kernel
+    without the call gives. In m24 it is diffed against the live kernel
+    under `CNG_OPENAT2_DENY` on both tiers where the host has `openat2`, and
+    against the kernel's answers recorded on 6.8 where it does not. The
+    previous build answered the first `openat2` there with `ENOSYS`, so the
+    run printed `openat2=unsupported` and none of the 42 cases. `-t o2test`'s
+    end-to-end leg now demands the synthesized `/proc` through the walk
+    everywhere, and m17's NULL-pathname differential holds an `openat2` the
+    reference cannot issue (qemu-user) to the `EFAULT` a kernel with the call
+    gives, where both sides used to read "unavailable".
+  - Not this: under `-u`, tar creates a directory with its final mode (0500)
+    and relies on root's DAC bypass to fill it, which the real uid does not
+    have — `touch` into a 0500 directory fails the same way, with or without
+    this change. Fixed by M98.
+
+- [x] **M98 — fake root's DAC bypass, lent**
+  Root is not held back by permission bits: `CAP_DAC_OVERRIDE` lets it create
+  and remove names in a directory whose mode forbids writing it and open a
+  file for an access its mode refuses, and `CAP_DAC_READ_SEARCH` lets it
+  search a directory with no x bit. `-u` is the real uid underneath and had
+  none of it. Under `-u`, tar could not fill a directory it had just made
+  0500 ("Cannot open: Permission denied" for every file in it) — GNU tar and
+  busybox tar both create a directory with its final owner bits when they
+  run as root, counting on exactly this. `rm -rf` could not empty such a
+  directory, a 0400 file could not be appended to, and a `chmod` through a
+  directory with no x bit was faked to success and changed nothing.
+  - No syscall gives an unprivileged process that override, but every inode
+    in the guest's tree is the real uid's, and an owner may change its mode.
+    So when the host refuses a path call with `EACCES` under fake root,
+    `cng_dispatch` (now a wrapper around the old body, `dispatch_1`) finds the
+    first inode on the call's way that the real uid owns and whose owner bits
+    fall short of what the call needs. `cng_pin_dac_find` walks it
+    descriptor by descriptor from the mount prefix, `O_NOFOLLOW` per
+    component. That inode is lent the bits through its own fd link, the call
+    is made again whole, and the mode is put back. This goes one inode at a
+    time, up to 16, since the next one short of its bits may only be
+    reachable once the first is searchable. A call the host allows costs
+    nothing; proot's fake root lends eagerly, to every directory of every
+    path.
+  - Whole, because a walk through a directory it may not search reads every
+    name past it as a plain one: a symlink there is only found by a second
+    walk, with the search bit lent.
+  - What each call needs (`dac_args`): write and search on the parent for a
+    name made or removed (`mkdirat`, `mknodat`, `symlinkat`, `unlinkat`,
+    `renameat*`, `linkat`'s new name, an `O_CREAT` open of a new name); the
+    open's access on an existing regular file or directory (with `O_TRUNC`
+    as write, and `O_TMPFILE` as write and search on the directory it
+    names); write for `truncate`; search for `chdir`/`chroot`'s directory;
+    write on a directory moved to another parent, whose `..` is rewritten
+    (and on the other one under `RENAME_EXCHANGE`); write on `linkat`'s
+    source directory under `-l`, whose first link moves the file into the
+    store. Every other path call only looks its name up, and is lent search
+    on the way. `execve` is not retried: it does not come back when it
+    succeeds, so nothing lent for it could be given back.
+  - Lends take turns across the session under an `flock` on the rootfs
+    directory, with every signal but SIGSYS blocked (the SIGSYS tier's mask
+    anyway; on `-R` a guest handler that longjmp'd out of the window would
+    have left the mode lent). Without the lock, a process refused while
+    another had the directory lent read the lent mode, found nothing short
+    and kept its `EACCES`. Four processes creating 25 files each in one
+    0500 directory lost a third of them. The restore gives way to a mode
+    someone else set meanwhile, so a concurrent `chmod` is never undone.
+  - `chattr_result` and `utimensat` no longer fake `EACCES` themselves:
+    that is a search the way refused, which is lent first, so the change is
+    made for real. Only what is left is faked as before (`dac_faked`).
+  - What it cannot do: lend anything on an inode of someone else's (a host
+    directory bound in, the host's `/proc` and `/dev`), where the refusal
+    stands. And the lent mode is a real mode for as long as the call takes:
+    a process outside the session can see it, and a SIGKILL in that window
+    leaves it lent.
+  - Test: `tests/guests/dacroot.c` runs 44 cases — names made, moved and
+    removed in a 0500 directory (relative to a dirfd too, as tar names its
+    members), files opened for what their mode refuses, a walk through two
+    levels of directories with no x bit with a symlink in one, four
+    processes creating in one directory at once, and the modes everything
+    was left with. m28 holds it to real root's output, recorded natively
+    with sudo on 6.8, on both tiers and with `CNG_L2S_FORCE`, and checks
+    the modes from the host's side as well; the previous build failed 75 of
+    the legs. busybox tar extracting a tree with 0555 directories in it,
+    then `rm -r` of the result, is the reported scenario end to end. GNU
+    tar 1.35 does the same on the VM (exit 0, `tar df` clean), where the
+    previous build failed it with "Cannot mkdir: Permission denied".
+
+- [x] **M99 — the initial stack's strings, in the kernel's order**
+  `npm -v` was a SIGSEGV on the Termux device (node 24, Ubuntu 26.04
+  rootfs), while a bare `npm` printed its usage. The fault was a store to
+  the first page of the guest's `ld.so`, from inside the `memset` that
+  libuv's `uv_set_process_title` runs on npm's first `process.title`
+  assignment, with a length of -73.
+  - libuv's `uv_setup_args` treats the argv strings as one buffer it may
+    reuse for the title. It measures that room as `argv[argc-1] + its
+    length + 1 - argv[0]`, and doesn't check that the strings really are
+    adjacent. The kernel leaves them so: `fs/exec.c` copies the exec'd
+    path, then envp, then argv down from a zero word at the top of the
+    stack, so the result reads ascending: argv[0] lowest, then the rest of
+    argv, the environment, and AT_EXECFN last. `cng_build_stack` pushed
+    each string down in argv order instead, which left argv descending.
+    With two arguments the room came out exactly 0 (an empty title, no
+    harm), which is why plain `npm` worked. From three on it is negative:
+    `node npm-cli.js -v` measured -70 for a 3-byte title.
+  - The strings are now laid out in the kernel's shape: one contiguous
+    run of argv, envp and the exec'd path under a zero word at the top,
+    and below that, as `create_elf_tables` puts them, the platform string
+    and the AT_RANDOM bytes. Both stack builds get it, the first load and
+    every emulated `execve`. postgres, nginx and perl's `$0`, which check
+    that the strings are adjacent before reusing them, now get the room a
+    kernel gives them, where before they settled for argv[0] alone.
+  - Not this (M100 fixed it): `/proc/<pid>/cmdline` is the registry's
+    copy from exec time, so a title written over argv does not show there,
+    as it would under the kernel.
+  - Test: `tests/guests/argvlayout.c` checks every adjacency (each argv
+    string right after the one before it, envp right after argv, AT_EXECFN
+    right after envp, then a zero word) and libuv's arithmetic, then
+    re-execs itself with more arguments and a fresh environment. m3 runs it
+    under the host's own loader first (qemu-user, or the kernel), then
+    under `-R`, so the emulated `execve` is reached on every host. The
+    previous build failed both chroot-ng legs. On the device the fixed
+    binary runs `npm -v`, `npm help` and `npm config get prefix`.
+
+- [x] **M100 — cmdline and environ are the guest's live strings**
+  The kernel reads `/proc/<pid>/cmdline` and `environ` out of the
+  process's memory when the file is read, from the ranges its exec
+  recorded (`mm->arg_start..arg_end`, `env_start..env_end`), so a title a
+  program writes over its argv is what `ps` and `top` print from then on.
+  node's `process.title`, `setproctitle(3)`, and nginx's and postgres's
+  status lines all work that way. chroot-ng served both files from the
+  registry's copies, taken at exec time, so all of those read back as the
+  command line the process started with.
+  - `cng_build_stack` records where it put the strings
+    (`cng_g_arg_start..cng_g_env_end`), and the registry publishes those
+    ranges with each process (`struct cng_procargs`), inherited at fork.
+  - Where the kernel takes `PR_SET_MM_MAP`, the stack publish points the
+    kernel's own record at those ranges, the way `set_comm` already fixes
+    comm. Every other field of the record goes back unchanged: code, data,
+    `start_brk` and `start_stack` from `/proc/self/stat`, `brk` from
+    `brk(0)`. With `auxv_size` 0 and `exe_fd` -1 the call needs no
+    privilege. The host's files then are the guest's, read live under the
+    kernel's own rules and permission checks, and `synth_kind` leaves
+    cmdline and environ to them. That covers readers the next bullet
+    can't serve, too: under Yama's `ptrace_scope` 1, the Ubuntu default,
+    a sibling `ps` may not read another process's memory. Host-side tools
+    now show the guest's command line, as they already show its comm.
+    The exception is a process's own environ. The kernel binds an environ
+    fd to the mm it was opened on, and a real exec leaves that mm behind:
+    measured with bash's `tr '\0' '\n' < /proc/self/environ`, whose
+    redirect is opened before the exec, the read comes back empty. Our
+    exec keeps the mm, so the host fd would follow the record into the
+    next program's environment instead (the VM run of m17 caught it). A
+    memfd filled at open from live memory keeps the opener's environment,
+    as before. cmdline is bound to the task and read at read time, and
+    after an exec the kernel's is the new program's, as the host file is.
+  - Android's kernels lack `CONFIG_CHECKPOINT_RESTORE` and refuse the call
+    with EPERM (measured: 5.15, Android 15), and qemu-user refuses
+    `PR_SET_MM` outright. There procfs reads the ranges itself
+    (`put_live`): its own through the copy-in pair, another process's with
+    `process_vm_readv`, under `get_mm_cmdline`'s rules (5.3+). The argv
+    range is served as it stands, embedded NULs and all. If its last byte
+    is no longer a NUL, the title ran on into the environment, and the
+    file is the string at `arg_start` up to its NUL: one page at most,
+    never past `env_end`. environ is its range as it stands. When the
+    memory can't be asked for (Yama, an undumpable process, qemu-user),
+    the copies answer as before. A stack the loader didn't lay out has no
+    ranges and keeps the copies too. Reading the ranges also lifts the
+    copies' 1 KiB and 4 KiB truncation.
+  - Not this: the synthesized file is still filled at open time, while
+    the kernel's is read at read time. A reader that holds the fd open
+    and seeks back sees the bytes from its open. Readers that open the
+    file for each sample, which is what `ps` and `top` do, are not affected.
+    For the same reason, an environ fd carried across an exec reads the
+    opener's environment, where the kernel's reads empty. On the
+    memory-reading path a cmdline fd carried across an exec also reads
+    the opener's, not the new program's.
+  - `CNG_MM_MAP_DENY=1` takes the call as refused, so the memory-reading
+    path can be run on a host that allows it.
+  - Test: `tests/guests/proctitle.c` re-execs itself with a known argv and
+    environment and checks its own files and a forked child's: as exec'd,
+    after an environment byte is rewritten, a short title padded with
+    zeros, and a title run past argv into the environment.
+    `record: kernel|ours` reports whether `/proc/self/stat`'s `arg_start`
+    names its argv[0]. m11 runs it under the host kernel first (native
+    hosts only: qemu-user fakes these files), then under `-R` with and
+    without `CNG_MM_MAP_DENY`. On the cross host a child's legs are not
+    asserted. The kernel reference agrees on the Termux device (Android
+    15, where chroot-ng reads memory) and on the VM (where the kernel's
+    record moves). A kernel before 4.18 leaves out the NUL that ends an
+    overflowing title (Android 8's 3.18, measured). Its overflow line is
+    skipped as no reference, and the rest is still compared.
+
+- [x] **M101 — a Termux X server attaches a guest's SysV segment**
+  `mpv --vo=x11` under termux-x11 got `BadAccess` for every `XShmAttach`
+  (request 82/1), then `BadShmSeg` for every `XShmPutImage`, and hung
+  waiting for completion events that never came. GTK and cairo hit the same
+  thing, since every MIT-SHM client does. Android has no SysV shm, so
+  Termux's X servers attach segments through libandroid-shmem: Xvfb and Xvnc
+  link it, termux-x11 embeds a copy (read from its `libXlorie.so`), and
+  proot's `--sysvipc` allocates through it, which is why the same rootfs
+  works under proot. libandroid-shmem's shmid is an address. Its high 16 bits
+  name the creator's abstract socket `"/dev/shm/%08x"`. An `shmat` of an id
+  the caller did not make connects there, sends the id, reads back the key,
+  receives the descriptor over `SCM_RIGHTS` and sizes it with
+  `ASHMEM_GET_SIZE`. The broker numbered segments 1, 2, 3..., and their high
+  half is 0, the socket id a process that made nothing takes for its own. So
+  the X server answered EINVAL without asking anyone.
+  - The broker speaks the protocol. The first segment a daemon creates binds
+    a socket id (1..0x7fff from its pid on, so every shmid stays positive),
+    and every id carries it over a 16-bit sequence. A host request there is
+    answered with the key and the backing. Only a peer of our uid is
+    answered, as on the rendezvous. The segment's mode is not checked: the X
+    server checks the client's credentials itself, and GTK's and cairo's
+    segments are 0600.
+  - Backing is ashmem wherever `/dev/ashmem` opens, since the size probe is
+    ashmem's ioctl, and memfd or the file tier elsewhere. Both tiers keep the
+    protocol, so it is covered off-device too.
+  - Not counted: a host attachment does not show in `nattch`. The protocol
+    has no detach to drop it again, and an attachment that is never dropped
+    would pin the segment for the namespace's lifetime. The host's own
+    descriptor keeps the memory alive past the guest's `IPC_RMID` and last
+    detach, as a kernel attachment would.
+  - Not this: export only, which is all `XShmAttach` needs. A guest `shmat`
+    of an id a Termux process made is still EINVAL, so an X server inside the
+    rootfs serving Termux-native clients gets no XShm. Keyed segments are not
+    shared with Termux's `$PREFIX/tmp/ashv_key_*` either. Ids now come round
+    after 65535 segments rather than 2^31.
+  - Test: `-t shmtest` group 11 is a libandroid-shmem client spelled out
+    (id shape, keys, stores in both directions, no `nattch`, a removed
+    segment served until its last detach, an unknown id unanswered) plus the
+    backing check, over both tiers. On Termux, m12 builds
+    `tests/guests/ashv_attach.c` against Termux's own libandroid-shmem and
+    runs it outside chroot-ng against `tests/guests/shm_ashv.c`. Verified on
+    the Pixel 5 with mpv under termux-x11.
+
+- [x] **M102 — a socket peer was the run's identity whatever ids it had**
+  XFCE worked as the fake root of `chroot-ng -l -u ... /bin/su - sylirre` and
+  failed as the user: "Unable to contact settings server: The connection is
+  closed". `dbus-send` got no reply either. Under `-u` every guest process has
+  the host's ids, which are what the kernel names a peer by, and `SO_PEERCRED`
+  remapped them to the identity the run began as, root. The session bus
+  `dbus-launch` started ran as sylirre, was told each client was root, and
+  closed the connection: libdbus lets only its own uid in unless told
+  otherwise. A received `SCM_CREDENTIALS` record went the same way, which is
+  what GLib's `g_unix_connection_receive_credentials` reads.
+  - Each process publishes its fake ids in the guest registry (`struct
+    cng_procids`): its real and effective uid and gid, written at every
+    committed change of the set (under the writer's lock, so they land in
+    order), at publish, at fork (copied by the parent, then rewritten by the
+    child from the set it inherited). `SO_PEERCRED` names a guest peer by its
+    effective ids. Any other peer is remapped as before: a host process, one
+    whose pid was reused, another invocation without `--shared-proc`.
+  - A credentials record names the sender's ids by its last claim: an allowed
+    claim is recorded with the ids before it goes out in the host's. With no
+    claim, the record names the sender's real ids, which is what SO_PASSCRED
+    attaches. A change of ids drops the claim. This lifts M91's limitation: a
+    fake root's claim of uid 1 now reads as uid 1, as the kernel delivers it.
+  - `capget` of another guest takes its published effective uid too, rather
+    than the configured identity.
+  - Not exact: the ids are the peer's now, not those the kernel recorded at
+    `connect()`, `listen()` or `socketpair()`. The claim is the process's,
+    not the message's, so an implicit record after a claim reads as that
+    claim. Both differ only when the ids differ. `SO_PEERGROUPS` still
+    reports the host's groups, and another process's `/proc/<pid>/status`
+    still shows the startup identity (both lifted by M104).
+  - The broker namespace tag is now `cng-ipc.v5` and the registry file
+    `chroot-ng-procreg.v3`, since `struct proc_ent` changed (M100 had changed
+    it without a bump).
+  - Test: m7, `tests/guests/peerid.c`, on both tiers: a server and a client
+    take their ids (1234/1234, 0/1234, 1234/0) and each prints what
+    `SO_PEERCRED` and both kinds of record say of the other. The old build
+    reports 0 in each row where the peer is 1234. `tests/guests/scmcred.c`
+    adds a full drop (implicit record and own claim after it), and fake
+    root's claims of another uid or gid are now asserted as the kernel's.
+    On the Pixel 5, as sylirre, `xfconf-query` reaches xfconfd and `gdbus`
+    and `dbus-send` reach the session bus.
+
+- [x] **M103 — a capset that dropped nothing was refused to anyone but root**
+  `google-chrome --no-sandbox` came up as the fake root of `chroot-ng -l -u
+  ... /bin/su - sylirre` and not as the user: "credentials.cc:365] Check
+  failed: . : Operation not permitted (1)", then "Did not receive ping from
+  zygote child". The zygote forks every child through
+  `ForkAndDropCapabilitiesInChild`, whose `capset` of three empty sets is
+  CHECKed, and under `-u` a capset was accepted whole for a fake root and
+  refused whole for anyone else. The kernel lets any process drop what it
+  has, nothing included.
+  - The set is all of them for a fake root and none for anyone else, as
+    `capget` reports it, and a capset is judged against it by `cap_capset`'s
+    rules: the new permitted set within the old, the effective within the new
+    permitted, the inheritable within the old inheritable and permitted. So a
+    fake root is refused an effective bit it does not also permit, and anyone
+    else any capability at all. The bits past `CAP_LAST_CAP` are cleared
+    first, as `sys_capset` clears them (the last one is probed with
+    `PR_CAPBSET_READ`).
+  - The header's pid is compared with the calling thread's id, which is what
+    `task_pid_vnr(current)` is: a thread naming itself by its own id is
+    allowed, and by its process's pid EPERM. It was the other way round.
+  - Not exact: a change is not recorded, so a fake root that drops its
+    capabilities still has them all, and a change of ids gives the set the
+    new euid implies (no `SECBIT_KEEP_CAPS`, no file capabilities).
+  - Test: m7, `tests/guests/capset.c`, on both tiers, as fake root and
+    dropped to 1234, each row in a child of its own; every row is the
+    kernel's answer to real root and to root dropped to 1234 (arm64 VM, row
+    for row). The old build refuses the empty set. On the Pixel 5, headless
+    Chrome as sylirre prints the page it was given.
+
+- [x] **M104 — another process's groups and /proc owner were the run's**
+  After M102 a socket peer's ids were its own, but three accounts of another
+  process still came from the host. `SO_PEERGROUPS` returned the host's
+  groups whoever the peer was (on Android the app's 3003, 9997, 20337, ...).
+  Another guest's status file had the host's line remapped, the startup
+  identity, and the host's groups. And `/proc/<pid>` and everything under it
+  were owned by the identity the run began as, for every process, our own
+  included. `ps` names a process's user by that owner (procps reads the
+  status `Uid:` line as well), so after `su - sylirre` the shell and all it
+  started were root's in `ps` and `top`. `ps -L` and `top -H` read each
+  thread's `task/<tid>/status`, which went through untouched: the host's uid
+  and groups.
+  - The registry entry carries all eight ids and the supplementary groups
+    (up to `CNG_NGROUPS_MAX`), written in one window and read as one.
+  - `SO_PEERGROUPS`: a peer the kernel names by the host's ids gets a
+    guest's published groups, or, any other, those of the identity the run
+    began as, which are none (the fake set starts with none). A peer named by
+    other ids is the kernel's to describe, and so is every error before there
+    is a peer (`ENODATA`, or `ENOPROTOOPT` before 4.13). A buffer too short is
+    `ERANGE` with the length the list needs written back.
+  - Status: another guest's `Uid:`, `Gid:` and `Groups:` lines are the ones
+    it publishes, and `task/<tid>/status` is synthesized as well, with its
+    process's ids.
+  - stat, statx and fstat of a procfs name inside a guest's process
+    directory that the host gave the host's ids take that process's
+    published effective uid and gid (ours from the live set), as
+    `task_dump_owner` gives them. An entry the host gave anyone else stands:
+    a host process's, or one the kernel made root's because the process is
+    not dumpable.
+  - Not exact: dumpability is the host's, which a change of fake ids does
+    not touch, so an entry other than the process's world-readable
+    directories is its new owner's until the next exec, where the kernel
+    would make it root's. `/proc/<tid>` of a thread that is not a group
+    leader stays hidden, as before.
+  - The broker namespace tag is now `cng-ipc.v6` and the registry file
+    `chroot-ng-procreg.v4`, since `struct proc_ent` changed.
+  - Test: m7, `tests/guests/peerid.c` again: each side also prints the
+    other's groups by `SO_PEERGROUPS` (and its `ERANGE`), the `Uid:`, `Gid:`
+    and `Groups:` lines of its status and its thread's, and the owner of its
+    `/proc/<pid>` by stat, fstat, fstatat (`task`, relative to `/proc`) and
+    statx, and the client the owner of its `/proc/self`. Every row is what
+    the kernel answers real root the same program (arm64 VM). The old build
+    reports the host's group and 0:0 there. m11's `-t proctest` checks that
+    a dropped child is read by all eight ids and its groups. On the Pixel 5,
+    as sylirre, `ps`, `ps -L` and `top` name the user's processes and
+    threads sylirre's and `su` root's.
+
+- [x] **M105 — a tracer could not read the FP/SIMD registers**
+  A crashed Chrome left no crash report. Its crash handler (crashpad)
+  attaches to every thread of the crashed process and reads `NT_PRFPREG`
+  from each, and every one answered EINVAL: "ptracer.cc:228] ptrace: Invalid
+  argument (22)" once per thread, then "Couldn't initialize main thread",
+  "thread not found", and no minidump. The regset was wrong three ways.
+  - An attach stop had no signal frame. The kick handler records its frame
+    only for a task that already has a per-task slot, and the attach is what
+    makes the slot, so the stop knew the general registers but not where the
+    FP/SIMD state was. The adoption keeps the kick's frame now.
+  - A stop with no signal frame at all had nowhere to look: every syscall
+    stop on `-R`, one through a site already rewritten on the seccomp tier,
+    and the emulated execve's. These read and write the live registers,
+    which are the guest's there: the monitor is built `-mgeneral-regs-only`
+    and the kernel preserves them across the syscalls made since. (clang's
+    assembler rejects FP instructions under that flag even in inline asm, so
+    the two routines enable `fp` and `simd` for themselves.)
+  - A stop that did have a frame read its FPSIMD record as if it were a
+    `user_fpsimd_state`. The record has fpsr and fpcr first and the q
+    registers after, so the file came back shifted by 8 bytes, 8 bytes past
+    the record were read, and a write overwrote the next record's header.
+    Both directions convert now. A write over live SVE state goes into the
+    SVE record as well, since sigreturn restores the vectors from that one
+    then: zeroed, with the new q registers at the bottom of the z registers,
+    which is what the kernel's `sve_sync_from_fpsimd_zeropad` does.
+  - GETREGSET and SETREGSET apply `ptrace_regset`'s rules to every regset.
+    A length that is not a whole number of the regset's units is EINVAL, a
+    longer one is cut to the regset, and `iov_len` says what was
+    transferred; it used to be the full size even for a shorter buffer. A
+    short `NT_PRSTATUS` write replaces only that much, and a pstate outside
+    EL0t AArch64, or with D, A, I or F set, is refused as `valid_user_regs`
+    refuses it (sigreturn would have killed the task for it).
+  - Found while measuring this, fixed by M106:
+    - A stop taken while the thread was inside chroot-ng (blocked in a
+      dispatched syscall on `-R` or at a rewritten site, or in a bounced
+      masked wait) reports chroot-ng's own pc and sp. In the dump, the
+      crashed thread is in `CHROOT-NG+0x130`.
+    - On the seccomp tier, a blocking call dispatched from inside the
+      SIGSYS handler runs with every signal masked. Without `-R` that is
+      every trapped call, not only a site's first. It cannot be signalled
+      until it returns, not even by SIGTERM's default action, and an
+      attach to it hangs the tracer.
+    - The kick has no `SA_RESTART`, so an attach makes the tracee's
+      interrupted syscall fail with EINTR where the kernel restarts it.
+  - Test: m18 `ptrace fpregs` (`tests/guests/pt_probe.c`). The tracee holds
+    a marker in v8 (xmm8 on the x86-64 oracle) across a blocking read. The
+    tracer reads the marker at the attach stop and at the read's entry stop
+    and writes a new one at each, and once the read returns the tracee
+    reports what it held. Then the length rules on `NT_PRFPREG` and
+    `NT_PRSTATUS`. The output matches the kernel on the dev host (`-R` under
+    qemu) and on the Zenfone 10 and Pixel 5 on both tiers (arm64 VM
+    oracle). The old build answers EINVAL at the attach stop and a shifted
+    file at a SIGSYS stop, and never shows the tracee a write. With the fix,
+    a headless Chrome renderer killed by SIGSEGV under `-l -u` leaves a
+    minidump in `Crash Reports/completed` with all 16 of its threads.
+
+- [x] **M106 — a call blocked in the SIGSYS handler could not be signalled**
+  On the seccomp tier, which is every run without `-R`, each trapped call is
+  made from the SIGSYS handler, and the handler runs with every signal but
+  SIGSYS masked. A call that blocked there could be reached by nothing but
+  SIGKILL. `busybox nc -l` outlived SIGTERM, `^C` did not reach a `cat` of a
+  FIFO, a guest handler ran only after the call returned, and a ptrace
+  attach hung its tracer, since the kick that stops a task is masked with
+  the rest. The trapped set has `accept`, `connect`, `recv*` and `send*` in
+  it for AF_UNIX translation, and a tracee traps every syscall. The M105
+  note blamed only a site's first call; that holds under `-R` alone.
+  - A trapped call that can block is no longer made in the handler. The
+    dispatcher answers it with an internal code, and the handler resumes the
+    thread in a stub in the gate that makes the call from guest context. A
+    call made as the guest made it runs from the masked-wait stub
+    (`cng_bounce_wait`) with its own registers. One with a path or a socket
+    address to translate runs the whole dispatch from guest context
+    (`cng_bounce_dispatch`, the -R trampoline's path, with the record below
+    the guest's sp as its register file). The completion trap puts the
+    registers back either way. The call then blocks on the guest's own
+    mask, and a signal ends or restarts it by the kernel's rules. A
+    dispatch made this way makes its blocking svc on the guest's own stack,
+    below the record, so a guest handler that runs meanwhile lands there and
+    not on the scratch stack. A conservative GC's suspend handler, which
+    scans from its own sp, depends on that.
+  - What can block: a socket call on a descriptor without `O_NONBLOCK` and
+    without `MSG_DONTWAIT` (one `fcntl`), an open of a FIFO or a character
+    device other than the memory devices without `O_NONBLOCK`, `O_PATH` or
+    `O_DIRECTORY` (one `fstatat`, the owner's choice of cost), and a
+    tracee's read, write, futex, sleep, lock, splice and AIO calls. A
+    descriptor that does not block costs one `fcntl`. A tracer's own
+    wait4/waitid and the System V IPC waits stay in the handler, which polls
+    them for signals.
+  - The ptrace kick is `SA_RESTART`. An attach is a stop, not a delivery,
+    and the kernel restarts the call it cut short; the kick used to fail it
+    with EINTR. A bounced ppoll, pselect6 or sigsuspend that the kick ended
+    with EINTR is put back to be made again, as the kernel restarts those
+    (ERESTARTNOHAND) when no handler runs; their timeouts are written back,
+    so the restart is the kernel's own. A wait polled in the handler that
+    sees a kick pending (one the guest's mask lets in) is restarted from its
+    svc, so the kick lands there. The TRACEME window, where a parent sits in
+    a native wait4 before it is armed, is restarted into the tracer filter
+    the arming kick stacks rather than knocked out with EINTR.
+  - A stop the kick takes shows the guest's registers. Landed in a bounce
+    stub or an `-R` trampoline, it puts the frame back to the guest's state,
+    as if the call were not yet made (pc at the svc, its arguments in x0..x5,
+    which is how the kernel shows a call it will restart) or already over.
+    Landed in the dispatcher, whose frames cannot be stepped out of, it
+    reports the guest's registers from the dispatch's record, which
+    `cng_run_scratch_in` keeps per thread (three stores per dispatch). The
+    FP/SIMD state then comes from the kick's own frame. A tracer that
+    changes the registers there abandons the call: the blocking svc is cut
+    short, its result dropped, and a call left at its svc is made again as
+    the tracer left it. A tracee's owed exit stop is given first, with
+    -ERESTARTSYS, and a tracer that resumes into syscall tracing sees the
+    restart's entry stop, as the kernel gives them.
+  - Under `-R`, the first trap from a site the rewrite just made a branch is
+    sent back to that site, so it runs through the trampoline like every
+    later call from there.
+  - Residue: a call native to the guest that the kernel answers
+    ERESTARTNOHAND or ERESTART_RESTARTBLOCK (poll, select, nanosleep,
+    clock_nanosleep, a timed futex) still sees EINTR after an attach, as
+    after any handled signal. The kick is a handler, and x0 is gone by the
+    time it runs, so it cannot make the call again. A siglongjmp out of a
+    guest handler that interrupted a dispatch made from guest context leaves
+    that dispatch behind, as on `-R`. Under `-R` a guest handler that runs
+    while a call blocks is still delivered on the scratch stack: putting the
+    svc on the guest's stack there would cost the hot path a lookup per call.
+  - Found while testing, fixed by M107: a crashed Chrome browser still
+    hung. GLib's `gmain` thread blocks nearly every signal, the kick
+    (SIGRTMAX) among them, so crashpad's PTRACE_ATTACH to it never stopped
+    it, and crashpad waited in its waitpid for good with every other thread
+    parked in its attach stop. The kernel attaches with SIGSTOP, which no
+    mask holds back.
+  - Tests: m6 `tests/guests/blkcall.c` blocks in accept, recvfrom, a FIFO
+    open and an AF_UNIX recvfrom that wants the sender's address, signals
+    the thread with and without `SA_RESTART`, and checks SIGTERM against a
+    blocked accept. On the SIGSYS tier it also checks that the handler ran
+    on the thread's own stack. It matches the kernel on both tiers (arm64
+    VM). The old build ran every handler only after the call, gave no EINTR,
+    and SIGTERM did not kill. m18 `ptrace blocked` (`tests/guests/pt_probe.c`) attaches
+    to a thread blocked in a read and in an accept through one svc of known
+    address. It checks that pc is where the kernel shows a blocked call
+    (arm64 rewinds before the stop, x86-64 after), that arg0 is the fd and
+    that sp is the thread's own. It then points the read at another pipe
+    and checks that both calls restart. The old build reports chroot-ng's
+    registers on both tiers, answers EINTR, and hangs the attach to the
+    accept on the SIGSYS tier. m18 also runs every `pt_probe` scenario on
+    the SIGSYS tier when the filter is live; they ran under `-R` only, so
+    the tier a device runs by default had only `-t ptracetest`'s
+    synthesized traps. All 26 match the kernel there (arm64 VM).
+
+- [x] **M107 — an attach could not stop a thread that blocked the kick**
+  The kick that stops a running task for its tracer (PTRACE_ATTACH, SEIZE's
+  INTERRUPT, a routed stop signal) is a real-time signal, and a thread can
+  block it. GLib's threads block nearly everything. The kernel attaches with
+  SIGSTOP, which no mask holds back, so a crashed Chrome's crashpad stopped
+  every thread but `gmain`, whose kick sat pending for good. Crashpad waited
+  on it and the browser never exited. Owner's choice: send such a request
+  as a SIGSYS of ours, the one signal the guest can never block (SIGSYS is
+  taken out of every guest mask).
+  - The tracer reads the target thread's `SigBlk` when it sends the kick,
+    and sends the request as a SIGSYS as well (`SI_QUEUE`, the kick's magic)
+    when the kick is blocked. While a request is outstanding, its wait
+    sends the SIGSYS again every slice, as long as the kick is still
+    blocked there. A standard signal absorbs a second one, so the resend
+    costs nothing. It covers a thread that blocks the kick after the first
+    look, and a SIGSYS absorbed by one of the target's own traps. The
+    session must have our SIGSYS handler (`cng_g_sigsys_ready`): without
+    it, the default action would kill the target.
+  - The SIGSYS handler takes the request at once in guest code, in a bounce
+    stub, or in a dispatch running in guest context, the way the kick's
+    handler takes one. Anywhere else in chroot-ng no stop can be taken on
+    the frame: a dispatch the handler itself is making, the work of our kick
+    or trace handler (marked per thread, never across a guest's handler), or
+    a fork child's hooks, which M86 keeps the kick out of. There the request
+    is noted for later. The handler underneath takes it on its way out, a
+    wait it polls ends for it, and otherwise the tracer's resend reaches the
+    thread later. The pending requests are claimed atomically. A nested
+    request that took the attach too made a second SIGSTOP stop, which the
+    tracer never collected (found with `fpregs` under `-R`).
+  - SIGSYS costs what the kick does not. A thread holds at most one
+    standard signal pending, so a trap taken while our SIGSYS is pending is
+    merged into it. The kernel skips the call, puts its first argument back
+    in x0, and delivers our siginfo instead. The handler makes such a call
+    again (pc back to the svc, which is also where a stop shows a call about
+    to be made). To decide, it asks whether the call behind the frame traps
+    at all, by running the installed filters over it (`cng_seccomp_traps`,
+    `cng_bpf_run` moved out of the test code, the base program kept from its
+    install). An ambient refusal counts by `cng_blocked`, and a filter that
+    has never trapped (qemu-user) makes nothing a trap. A call a handler of
+    ours answered and just returned from leaves the same frame. Every return
+    of our SIGSYS and kick handlers therefore notes the frame it goes back
+    to (pc, sp, x0-x2, x8, x30), and a request that lands on exactly that
+    frame is not read as having displaced anything. Only a request delivered
+    straight onto the guest's frame is judged at all. One left for a handler
+    and taken on that handler's frame displaced nothing there. Judged anyway,
+    with the filters an attach had added since, a write the guest had just
+    made was taken for a displaced trap and made twice: `attachmany` on the
+    Pixel 5's SIGSYS tier, 1 run in 40.
+  - Residue: which of the tracee and tracer filters a thread carries comes
+    from its own per-task record, so a thread created by a traced one after
+    its attach, which inherits the filter but not the record, can have a
+    displaced trap misjudged. A request that lands in our trace handler
+    while it runs a guest's handler is not taken there; the resend reaches
+    it.
+  - Tests: m18 `ptrace blockedmask` is `blocked` with every signal blocked
+    in the tracee. `ptrace blockspin` attaches 100 times to a thread with
+    every signal blocked that spins on `mkdir`/`rmdir`, which trap. Every
+    attach must stop it. A lost call would return -100, and one made twice
+    would return EEXIST. Both run on both tiers and match the kernel (arm64
+    VM, dev host). The old build hangs the attach in both scenarios. With
+    the remake of a displaced call disabled, `blockspin` loses calls on the
+    SIGSYS tier in two runs of three, and with the returned-to frame
+    ignored it makes calls twice in three of three. On the Pixel 5, a
+    crashed Chrome browser now exits in 3 s and leaves a minidump with all
+    37 of its threads, none with a pc in chroot-ng.
 
 - [ ] **M10 — (optional) user_notif supervisor tier for kernels >= 5.0**
 

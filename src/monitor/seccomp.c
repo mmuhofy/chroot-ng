@@ -10,6 +10,7 @@
 #include "cng/l2s.h"
 #include "cng/monitor.h"
 #include "cng/procfs.h"
+#include "cng/procreg.h"
 #include "cng/rt.h"
 #include "cng/seccomp.h"
 #include "cng/syscall.h"
@@ -120,7 +121,8 @@ static const int id_syscalls[] = {
     __NR_fchown,    __NR_fchmod,    __NR_capget,    __NR_capset,
     /* SO_PEERCRED reports the real invoking uid, and ps/tmux/polkit-style peer
      * checks compare it against getuid() — which under --fake-id is the fake id.
-     * A guest daemon would reject its own client on the mismatch. */
+     * A guest daemon would reject its own client on the mismatch. SO_PEERGROUPS
+     * reports the host's groups, likewise. */
     __NR_getsockopt,
 };
 #define NID ((int)(sizeof(id_syscalls) / sizeof(id_syscalls[0])))
@@ -357,7 +359,7 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
 
     /* Build the trapped syscall list (path set + SysV IPC set, plus the id set
      * when faking, plus the conditional entries below). */
-    int nr[NPATH + NIPC + NID + NROFD + 6];
+    int nr[NPATH + NIPC + NID + NROFD + 11];
     int nsys = 0;
     for (int i = 0; i < NPATH; i++)
         nr[nsys++] = path_syscalls[i];
@@ -366,6 +368,13 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     if (cng_g_fake_id)
         for (int i = 0; i < NID; i++)
             nr[nsys++] = id_syscalls[i];
+    /* CNG_SETID_DENY without the id set: the setters it takes as refused are
+     * trapped, which is how Android's filter hands them over — as a SIGSYS
+     * for the dispatcher to answer (cred.c). Fewer than the id set, and only
+     * in its place, so the bound above holds. */
+    else if (cng_g_setid_deny)
+        for (int i = 0; i < cng_setid_deny_n; i++)
+            nr[nsys++] = cng_setid_deny_nrs[i];
     int has_ro = view_has_ro();
     if (has_ro)
         for (int i = 0; i < NROFD; i++) {
@@ -396,6 +405,17 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
         nr[nsys++] = __NR_process_vm_readv;
         nr[nsys++] = __NR_process_vm_writev;
         nr[nsys++] = __NR_pidfd_open;
+    }
+    /* The signal family names a process by pid too, and its group and
+     * broadcast forms name every process at once (dispatch.c). The view tells
+     * a guest from a host process only through the registry, so without one
+     * these run native rather than refuse every other pid. */
+    if (!cng_g_no_proc && cng_g_procreg_backing != CNG_PROCREG_B_NONE) {
+        nr[nsys++] = __NR_kill;
+        nr[nsys++] = __NR_tkill;
+        nr[nsys++] = __NR_tgkill;
+        nr[nsys++] = __NR_rt_sigqueueinfo;
+        nr[nsys++] = __NR_rt_tgsigqueueinfo;
     }
     /* getdents64 does three jobs, and it has to be trapped for any one of them:
      * it hides the l2s backing files, it filters host processes out of a /proc
@@ -654,6 +674,29 @@ int cng_build_seccomp(struct sock_filter *f, int cap) {
     f[n++] = (struct sock_filter)CNG_BPF_STMT(
         CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
 
+    /* mremap, only with MREMAP_DONTUNMAP (args[3]): the move that leaves the
+     * old range mapped, where a copy the loader made of an image reads back
+     * zeroes and the file mapping it stands in for reads back the file
+     * (execmap.c). Every other mremap — realloc growing a large block — stays
+     * off the handler, and DONTUNMAP itself is rare: V8 moving its builtins,
+     * a garbage collector's userfaultfd compaction. */
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, (uint32_t)__NR_mremap, 0,
+        5); /* not mremap -> reload nr */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_ARGS + 24); /* A = flags */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K, CNG_MREMAP_DONTUNMAP);
+    f[n++] = (struct sock_filter)CNG_BPF_JUMP(
+        CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 1,
+        0); /* no DONTUNMAP -> allow, DONTUNMAP -> trap */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
+                                              CNG_SECCOMP_RET_TRAP);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_ALLOW); /* no DONTUNMAP */
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS, CNG_SD_NR); /* reload A=nr */
+
     /* The mask-taking waits (see the note in path_syscalls): trapped only
      * when the sigset argument is non-NULL. It is a pointer, so both halves
      * are tested. Offsets: for each, "not this nr" skips the whole block;
@@ -798,7 +841,10 @@ static int install_filter(const struct sock_filter *f, int n) {
  *
  * Stacked filters compose by most-restrictive-action-wins, so this also
  * converts the base filter's RET_ERRNO answers into traps; the dispatcher
- * turns those back into -ENOSYS (see cng_denied_syscall). */
+ * turns those back into -ENOSYS (see cng_denied_syscall).
+ *
+ * Its trap carries a tag (CNG_TRAP_TAG_TRACEALL, see monitor.h), and so does
+ * the tracer's below. */
 int cng_build_seccomp_traceall(struct sock_filter *f, int cap) {
     if (cap < CNG_SECCOMP_TRACEALL_INSNS)
         return -1;
@@ -821,8 +867,8 @@ int cng_build_seccomp_traceall(struct sock_filter *f, int cap) {
         CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K, 0, 0, 1); /* thread -> allow */
     f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
                                               CNG_SECCOMP_RET_ALLOW);
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
-                                              CNG_SECCOMP_RET_TRAP);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACEALL);
     return n;
 }
 
@@ -860,8 +906,8 @@ int cng_build_seccomp_tracer(struct sock_filter *f, int cap) {
             (uint8_t)(k - i), 0);
     f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
                                               CNG_SECCOMP_RET_ALLOW);
-    f[n++] = (struct sock_filter)CNG_BPF_STMT(CNG_BPF_RET | CNG_BPF_K,
-                                              CNG_SECCOMP_RET_TRAP);
+    f[n++] = (struct sock_filter)CNG_BPF_STMT(
+        CNG_BPF_RET | CNG_BPF_K, CNG_SECCOMP_RET_TRAP | CNG_TRAP_TAG_TRACER);
     return n;
 }
 
@@ -874,6 +920,12 @@ int cng_install_seccomp_tracer(void) {
 /* 0, or -errno: cng_run prints the number when the install is what ends the
  * run, so a failure here has to carry the kernel's own answer rather than -1
  * (which would read as EPERM). */
+/* The base filter as installed, kept for cng_seccomp_traps. Every guest task
+ * carries it from here on, inherited across fork and kept across the emulated
+ * execve, which is why one copy answers for all of them. */
+static struct sock_filter g_base[CNG_SECCOMP_MAX_INSNS];
+static int g_base_n;
+
 int cng_install_seccomp(void) {
     struct sock_filter f[CNG_SECCOMP_MAX_INSNS];
     int n = cng_build_seccomp(f, (int)(sizeof f / sizeof f[0]));
@@ -887,5 +939,91 @@ int cng_install_seccomp(void) {
     /* prctl path is 3.5+ (the seccomp() syscall is only 3.17+). */
     r = sys_prctl(CNG_PR_SET_SECCOMP, CNG_SECCOMP_MODE_FILTER,
                   (unsigned long)&prog, 0, 0);
+    if (r == 0) {
+        memcpy(g_base, f, (size_t)n * sizeof f[0]);
+        g_base_n = n;
+    }
     return (int)r;
+}
+
+uint32_t cng_bpf_run(const struct sock_filter *f, int n, const uint32_t *data,
+                     int *bad) {
+    uint32_t A = 0;
+    for (int pc = 0; pc < n;) {
+        const struct sock_filter *i = &f[pc];
+        switch (i->code) {
+        case CNG_BPF_LD | CNG_BPF_W | CNG_BPF_ABS:
+            if (i->k & 3 || i->k >= 64) { /* seccomp_data is 64 bytes */
+                *bad = 1;
+                return 0;
+            }
+            A = data[i->k / 4];
+            pc++;
+            break;
+        case CNG_BPF_ALU | CNG_BPF_AND | CNG_BPF_K:
+            A &= i->k;
+            pc++;
+            break;
+        case CNG_BPF_JMP | CNG_BPF_JEQ | CNG_BPF_K:
+            pc += 1 + (A == i->k ? i->jt : i->jf);
+            break;
+        case CNG_BPF_JMP | CNG_BPF_JGE | CNG_BPF_K:
+            pc += 1 + (A >= i->k ? i->jt : i->jf);
+            break;
+        case CNG_BPF_JMP | CNG_BPF_JGT | CNG_BPF_K:
+            pc += 1 + (A > i->k ? i->jt : i->jf);
+            break;
+        case CNG_BPF_RET | CNG_BPF_K:
+            return i->k;
+        default:
+            *bad = 1; /* an opcode this interpreter does not model */
+            return 0;
+        }
+        if (pc < 0 || pc >= n) { /* fell off the end: the kernel rejects this */
+            *bad = 1;
+            return 0;
+        }
+    }
+    *bad = 1;
+    return 0;
+}
+
+/* The kernel runs every filter stacked on a task and takes the most
+ * restrictive action, and of what ours return only KILL ranks above TRAP. A
+ * program the interpreter cannot run is taken to trap, which is the answer
+ * the caller can recover from: it makes the call again. */
+static int filter_traps(const struct sock_filter *f, int n, const uint32_t *d) {
+    int bad = 0;
+    uint32_t act = cng_bpf_run(f, n, d, &bad) & ~CNG_SECCOMP_RET_DATA;
+    return bad || act == CNG_SECCOMP_RET_TRAP;
+}
+
+int cng_seccomp_traps(long nr, const uint64_t *a, unsigned long ip,
+                      int traceall, int tracer) {
+    if (!g_base_n || !cng_g_traps_live)
+        return 0;
+    uint32_t d[16];
+    d[0] = (uint32_t)nr;
+    d[1] = CNG_AUDIT_ARCH_AARCH64;
+    d[2] = (uint32_t)ip;
+    d[3] = (uint32_t)(ip >> 32);
+    for (int i = 0; i < 6; i++) {
+        d[4 + 2 * i] = (uint32_t)a[i];
+        d[5 + 2 * i] = (uint32_t)(a[i] >> 32);
+    }
+    if (filter_traps(g_base, g_base_n, d))
+        return 1;
+    struct sock_filter f[CNG_SECCOMP_TRACEALL_INSNS > CNG_SECCOMP_TRACER_INSNS
+                             ? CNG_SECCOMP_TRACEALL_INSNS
+                             : CNG_SECCOMP_TRACER_INSNS];
+    int n;
+    if (traceall &&
+        (n = cng_build_seccomp_traceall(f, (int)(sizeof f / sizeof f[0]))) > 0 &&
+        filter_traps(f, n, d))
+        return 1;
+    if (tracer &&
+        (n = cng_build_seccomp_tracer(f, (int)(sizeof f / sizeof f[0]))) > 0 &&
+        filter_traps(f, n, d))
+        return 1;
+    return nr >= 0 && nr < CNG_NR_MAX && cng_blocked[nr];
 }

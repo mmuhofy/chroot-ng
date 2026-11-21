@@ -59,7 +59,9 @@ int cng_sig_install(int signo, cng_sighandler_t h) {
      * signals during the handler closes that window (they queue and fire on
      * sigreturn). SIGSYS stays unmasked (SA_NODEFER) so the gate-net can still
      * catch a nested trap; our own re-issues avoid Android-blocked syscalls via
-     * the block-list, so a nested SIGSYS does not arise in practice. */
+     * the block-list, so a nested SIGSYS does not arise in practice. The cost
+     * is that nothing reaches a call made in here, which is why a call that
+     * can block is not made in here at all (the bounce, below). */
     sa.mask.sig[0] = ~0UL & ~(1UL << (CNG_SIGSYS - 1));
     sa.restorer = (void *)cng_sigrestore;
     long r = cng_syscall6(signo, (long)&sa, 0, sizeof(cng_sigset_t), 0, 0,
@@ -94,14 +96,83 @@ int cng_sig_install(int signo, cng_sighandler_t h) {
  * handler puts the registers back from the record and resumes the guest
  * after its own svc with the wait's result. Two traps per masked wait. The
  * -R trampoline tier reaches these from ordinary context and needs none of
- * this: dispatch.c strips the copy and re-issues in place. */
+ * this: dispatch.c strips the copy and re-issues in place.
+ *
+ * The masked waits were the first calls bounced, and not the last: every
+ * trapped call that can block has the same problem in the handler, with the
+ * guest's mask or without one. Run there, it cannot be interrupted by anything
+ * but SIGKILL — a server in accept() ignored SIGTERM and ^C until a
+ * connection came, a FIFO open until the other end did, and a ptrace attach
+ * hung its tracer, since the kick is masked too. So the dispatcher answers
+ * such a call with a request to be bounced (CNG_EBOUNCE_*, see monitor.h), and
+ * it is, in one of two ways. One the dispatcher would make exactly as the
+ * guest made it — a tracee's read(), a recv on an inet socket — runs from
+ * cng_bounce_wait like a wait, its own registers in place (BOUNCE_RAW). One
+ * that has paths or socket addresses to translate runs the dispatcher itself
+ * from guest context (BOUNCE_DISP): sigreturn resumes at cng_bounce_dispatch,
+ * which calls into it with the record as the register file, as the -R
+ * trampoline calls into it with its own, and the completion trap puts the
+ * registers back from the record, result and all. Either way the call blocks
+ * on the guest's own mask, and a signal ends or restarts it by the kernel's
+ * own rules. */
 struct cng_bounce {
     unsigned long magic;
-    unsigned long long regs[31], sp, pc, pstate;
+    unsigned long long regs[31], sp, pc, pstate; /* a struct cng_uregs */
     unsigned long set;    /* the stripped sigset */
     unsigned long sel[2]; /* pselect6's {sigset *, size} */
+    long nr;              /* the call made, which a tracer may have redirected */
+    int kind;             /* BOUNCE_* */
+    int owed;             /* its entry stop was reported: an exit stop is owed */
 };
 #define CNG_BOUNCE_MAGIC 0x636e67426f756e63UL
+#define BOUNCE_WAIT 0 /* a mask-taking wait, its mask the record's copy */
+#define BOUNCE_RAW  1 /* the guest's call as it stands */
+#define BOUNCE_DISP 2 /* the dispatch, from guest context */
+
+/* Where the record goes: below the guest's sp, 16-aligned as sp must be. */
+static unsigned long bounce_rec(const struct cng_ucontext *uc) {
+    return (uc->uc_mcontext.sp - sizeof(struct cng_bounce)) & ~15UL;
+}
+
+/* The record of the guest's registers as the frame has them. */
+static void bounce_fill(struct cng_bounce *b, const struct cng_ucontext *uc,
+                        int kind, long nr) {
+    memset(b, 0, sizeof *b);
+    b->magic = CNG_BOUNCE_MAGIC;
+    b->kind = kind;
+    b->nr = nr;
+    b->owed = cng_pt_entry_owed();
+    for (int i = 0; i < 31; i++)
+        b->regs[i] = uc->uc_mcontext.regs[i];
+    b->sp = uc->uc_mcontext.sp;
+    b->pc = uc->uc_mcontext.pc;
+    b->pstate = uc->uc_mcontext.pstate;
+}
+
+/* A bounce of the guest's own call (BOUNCE_RAW) or of its dispatch
+ * (BOUNCE_DISP). 0 when there is no room below the guest's sp, and the caller
+ * makes the call in the handler, as every call was made before. */
+static int bounce_call(struct cng_ucontext *uc, long nr, int kind) {
+    struct cng_bounce b;
+    bounce_fill(&b, uc, kind, nr);
+    unsigned long rec = bounce_rec(uc);
+    if (cng_user_copyout((void *)rec, &b, sizeof b) < 0)
+        return 0;
+    uc->uc_mcontext.sp = rec;
+    if (kind == BOUNCE_RAW) {
+        uc->uc_mcontext.regs[8] = (unsigned long long)nr;
+        uc->uc_mcontext.pc = (unsigned long long)(unsigned long)cng_bounce_wait;
+    } else {
+        uc->uc_mcontext.pc =
+            (unsigned long long)(unsigned long)cng_bounce_dispatch;
+    }
+    return 1;
+}
+
+/* cng_bounce_dispatch's call into the dispatcher, with the record. */
+void cng_bounce_dispatch_c(struct cng_bounce *b) {
+    cng_dispatch_bounced((struct cng_uregs *)&b->regs[0], b->nr, b->owed);
+}
 
 /* Which argument carries the sigset pointer, and where its size is; -1 for
  * pselect6, whose sixth argument is a {sigset *, size} pair. */
@@ -142,8 +213,7 @@ static int bounce_start(struct cng_ucontext *uc, long nr) {
     unsigned long long *r = uc->uc_mcontext.regs;
     int size_arg, mi = wait_mask_arg(nr, &size_arg);
     struct cng_bounce b;
-    memset(&b, 0, sizeof b);
-    b.magic = CNG_BOUNCE_MAGIC;
+    bounce_fill(&b, uc, BOUNCE_WAIT, nr);
     unsigned long sel[2] = {0, 0};
     const unsigned long *setp = 0;
     unsigned long setsz = 0;
@@ -169,12 +239,7 @@ static int bounce_start(struct cng_ucontext *uc, long nr) {
         }
         b.set &= ~(1UL << (CNG_SIGSYS - 1));
     }
-    for (int i = 0; i < 31; i++)
-        b.regs[i] = r[i];
-    b.sp = uc->uc_mcontext.sp;
-    b.pc = uc->uc_mcontext.pc;
-    b.pstate = uc->uc_mcontext.pstate;
-    unsigned long rec = (b.sp - sizeof b) & ~15UL;
+    unsigned long rec = bounce_rec(uc);
     if (setp && mi < 0) {
         b.sel[0] = rec + __builtin_offsetof(struct cng_bounce, set);
         b.sel[1] = sel[1];
@@ -206,27 +271,89 @@ static int bounce_start(struct cng_ucontext *uc, long nr) {
     } else if (r[5]) {
         r[5] = rec + __builtin_offsetof(struct cng_bounce, sel);
     }
+    /* The number the svc makes is the one the tracer left (an entry stop can
+     * redirect it), not necessarily the x8 the guest trapped with. */
+    r[8] = (unsigned long long)nr;
     uc->uc_mcontext.sp = rec;
     uc->uc_mcontext.pc = (unsigned long long)(unsigned long)cng_bounce_wait;
     return 0;
 }
 
-/* The completion trap: the guest's registers back, its own pc and sp, the
- * wait's result in x0. A frame with no record behind it is left alone. */
-static int bounce_finish(struct cng_ucontext *uc) {
+/* The guest's registers back from the record `b`, its own pc and sp, and the
+ * call's result in x0 — the svc's, `res`, or the dispatch's own (BOUNCE_DISP
+ * keeps it in the record). */
+static void bounce_restore(struct cng_ucontext *uc, const struct cng_bounce *b,
+                           unsigned long long res) {
     unsigned long long *r = uc->uc_mcontext.regs;
+    for (int i = 1; i < 31; i++)
+        r[i] = b->regs[i];
+    r[0] = b->kind == BOUNCE_DISP ? b->regs[0] : res;
+    uc->uc_mcontext.sp = b->sp;
+    uc->uc_mcontext.pc = b->pc;
+    uc->uc_mcontext.pstate = b->pstate;
+}
+
+/* The completion trap. Returns 1 with the record in *b when the frame had one
+ * behind it (a frame without is left alone), 0 otherwise. */
+static int bounce_finish(struct cng_ucontext *uc, struct cng_bounce *b) {
+    if (cng_user_copyin(b, (void *)uc->uc_mcontext.sp, sizeof *b) < 0 ||
+        b->magic != CNG_BOUNCE_MAGIC)
+        return 0;
+    bounce_restore(uc, b, uc->uc_mcontext.regs[0]);
+    return 1;
+}
+
+/* The waits the kernel answers ERESTARTNOHAND when a signal cuts them short:
+ * it turns that into EINTR only when a handler is run, and a ptrace stop is
+ * not one, so an attach restarts them. Their timeouts are written back as
+ * they run, so making one again is the kernel's own restart. */
+static int bounce_nohand(long nr) {
+    return nr == __NR_ppoll || nr == __NR_pselect6 || nr == __NR_rt_sigsuspend;
+}
+
+int cng_bounce_unwind(struct cng_ucontext *uc, int stop, int *owed,
+                      long *rval) {
+    unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
+    unsigned long long *r = uc->uc_mcontext.regs;
+    unsigned long wait = (unsigned long)cng_bounce_wait,
+                  disp = (unsigned long)cng_bounce_dispatch,
+                  done = (unsigned long)__cng_gate_end;
+    int at_wait = pc == wait, after_wait = pc == wait + 4,
+        at_disp = pc == disp || pc == disp + 4,
+        after_disp = pc == disp + 8 || pc == disp + 12, at_done = pc == done;
+    if (!at_wait && !after_wait && !at_disp && !after_disp && !at_done)
+        return CNG_UNWIND_NONE;
     struct cng_bounce b;
     if (cng_user_copyin(&b, (void *)uc->uc_mcontext.sp, sizeof b) < 0 ||
         b.magic != CNG_BOUNCE_MAGIC)
-        return 0;
-    unsigned long long res = r[0];
-    for (int i = 1; i < 31; i++)
-        r[i] = b.regs[i];
-    r[0] = res;
-    uc->uc_mcontext.sp = b.sp;
-    uc->uc_mcontext.pc = b.pc;
-    uc->uc_mcontext.pstate = b.pstate;
-    return 1;
+        return CNG_UNWIND_NONE;
+    /* Undone: the call had not been made, or was cut short and is to be made
+     * again — at the svc of a raw or wait bounce (not reached, or a restart the
+     * kernel has pending), or at the dispatch's entry. A wait of the restarting
+     * kind that the kick ended with EINTR is undone as well, stop or not: the
+     * kick, not the guest, ended it. Without a stop, nothing else is touched:
+     * a pending restart is the kernel's to make, and the completion trap
+     * finishes a call that is over. */
+    int restart = after_wait && (s64)r[0] == -EINTR && bounce_nohand(b.nr) &&
+                  b.kind != BOUNCE_DISP;
+    int undo = restart || (stop && (at_wait || at_disp));
+    if (!undo && !stop)
+        return CNG_UNWIND_NONE;
+    *owed = b.owed;
+    if (undo) {
+        bounce_restore(uc, &b, b.regs[0]);
+        uc->uc_mcontext.pc = b.pc - 4;
+        *rval = restart ? -514 /*ERESTARTNOHAND*/ : -512 /*ERESTARTSYS*/;
+        return CNG_UNWIND_UNDONE;
+    }
+    /* Done: the svc returned (x0 its result), or the dispatch did (its result
+     * in the record), with only the completion trap left to make. The
+     * dispatch reported its own exit stop. */
+    bounce_restore(uc, &b, r[0]);
+    if (b.kind == BOUNCE_DISP)
+        *owed = 0;
+    *rval = (long)uc->uc_mcontext.regs[0];
+    return CNG_UNWIND_DONE;
 }
 
 /* sigaltstack, answered from the frame. The guest's alternate stack is what the
@@ -367,7 +494,33 @@ static int sigsys_syscall(struct cng_ucontext *uc, long nr) {
         return bounce_start(uc, nr);
 
     long res = cng_dispatch(nr, (long)r[0], (long)r[1], (long)r[2], (long)r[3],
-                            (long)r[4], (long)r[5], /*trapped=*/1);
+                            (long)r[4], (long)r[5], CNG_DISP_HANDLER);
+    /* A call that can block, sent out of the handler (see the bounce above),
+     * or made here after all when the guest's stack has no room for it. */
+    if (res == -CNG_EBOUNCE_RAW || res == -CNG_EBOUNCE_DISP) {
+        if (bounce_call(uc, nr,
+                        res == -CNG_EBOUNCE_RAW ? BOUNCE_RAW : BOUNCE_DISP))
+            return 0;
+        res = cng_dispatch(nr, (long)r[0], (long)r[1], (long)r[2], (long)r[3],
+                           (long)r[4], (long)r[5], CNG_DISP_TRAP);
+    }
+    /* A wait made here that a ptrace kick is waiting to interrupt: undone, so
+     * that the kick lands at the guest's svc, which is where the kernel shows
+     * a call it is going to restart, and the svc makes it again after. An
+     * entry stop reported for it owes an exit stop first, with the restart
+     * code the kernel's tracer sees there. */
+    if (res == -CNG_ERESTART) {
+        unsigned long long a0 = r[0];
+        r[0] = (unsigned long long)(long)-512 /*ERESTARTSYS*/;
+        cng_pt_syscall_exit(ur);
+        /* ...where a tracer that changes the code takes the restart away, as
+         * do_signal decides it from x0 after that stop. */
+        if ((long)r[0] == -512) {
+            r[0] = a0;
+            uc->uc_mcontext.pc -= 4;
+        }
+        return 0;
+    }
     if (cng_g_debug && res < 0 && res != -ENOENT)
         cng_dprintf(2, "[cng] dispatch nr=%ld -> errno=%ld\n", nr, -res);
     r[0] = (unsigned long long)res;
@@ -400,17 +553,28 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
         r[0] = (unsigned long long)(long)-ENOSYS;
         return;
     }
+    /* A trap out of the guest: the filter is live, and a trap a SIGSYS of
+     * ours displaces is something that can happen here (cng_seccomp_traps). */
+    cng_g_traps_live = 1;
+    /* ...and the filter that caught it said so, which is all a task that
+     * inherited one has to go by (cng_pt_note_trap). */
+    cng_pt_note_trap(si->si_errno);
 
     long nr = (long)r[8];
 
-    /* The completion of a bounced wait (see bounce_start): not a syscall of
-     * the guest's, and its site is ours — never one to rewrite. What is owed
-     * is the exit stop of the syscall that was bounced, whose entry stop was
-     * reported when it trapped. */
+    /* The completion of a bounce (see bounce_start and bounce_call): not a
+     * syscall of the guest's, and its site is ours — never one to rewrite.
+     * What is owed is the exit stop of the syscall that was bounced, whose
+     * entry stop was reported when it trapped (it was recorded then, since a
+     * guest handler that ran over the bounced call reported stops of its own
+     * since), unless the bounce was a dispatch, which gave it itself. */
     if (ca == (unsigned long)cng_bounce_svc_end) {
-        if (bounce_finish(uc) && cng_pt_active()) {
+        struct cng_bounce b;
+        if (bounce_finish(uc, &b) && b.kind != BOUNCE_DISP &&
+            cng_pt_active()) {
             struct cng_uregs *ur = cng_pt_uregs(uc);
             cng_pt_set_frame(ur, uc);
+            cng_pt_entry_set(b.owed);
             cng_pt_syscall_exit(ur);
             cng_pt_step_report(ur);
         }
@@ -424,9 +588,17 @@ void cng_sigsys_body(struct cng_ucontext *uc, cng_siginfo_t *si) {
      * headers named no code — that arrive here. Patch it, so the site costs
      * this trap once. (`rt_sigreturn` is the site that must never become a
      * trampoline call; the filter does not trap it, and if it ever did, this
-     * is where that would stop being true.) */
-    if (nr != __NR_rt_sigreturn)
-        cng_rewrite_site(ca - 4);
+     * is where that would stop being true.)
+     *
+     * A site that is a branch now is also the way to make this very call:
+     * resumed at the site, the thread runs it through the trampoline, from
+     * its own context and on its own mask, as every later call from there
+     * will be. Made here instead, the first call from each site ran with every
+     * signal blocked — the one that blocks, for as long as it blocked. */
+    if (nr != __NR_rt_sigreturn && cng_rewrite_site(ca - 4)) {
+        uc->uc_mcontext.pc = ca - 4;
+        return;
+    }
 
     /* Untraced — which is every guest until something in the session starts
      * tracing — goes straight to the syscall with no ptrace work at all. A
@@ -486,6 +658,21 @@ static struct {
      * Not the live mask, which keeps SIGSYS open whatever the guest asked: this
      * is what the exec's de_thread reads to leave a thread that is leaving. */
     int sigfull;
+    /* The innermost dispatch this thread is running from guest context
+     * (cng_run_scratch_in), for a ptrace stop that lands inside it. */
+    struct cng_gframe *gf;
+    /* A ptrace request carried by SIGSYS that landed where no stop can be
+     * taken, left for the handler it interrupted to take (sigsys_kick); and
+     * how deep this thread is in our other handlers' own work, which is
+     * such a place (cng_sig_in_handler). */
+    int attach;
+    int inh;
+    /* The frame a handler of ours last returned this thread to: part of the
+     * register file, enough to tell it from any frame the guest has since
+     * run to (cng_sig_returned_to). */
+    struct {
+        unsigned long long pc, sp, x0, x1, x2, x8, x30;
+    } back;
 } cng_scr[CNG_SCR_N];
 
 /* Claim `*p` from `want` to `tid` (inline LL/SC so we need no libgcc atomics
@@ -634,6 +821,10 @@ static int cng_scratch_slot(long tid) {
         cng_scr[i].busy = 0;
         cng_scr[i].uc = 0;
         cng_scr[i].sigfull = 0;
+        cng_scr[i].gf = 0;
+        cng_scr[i].attach = 0;
+        cng_scr[i].inh = 0;
+        memset(&cng_scr[i].back, 0, sizeof cng_scr[i].back);
         /* Its owner can have died between claiming the slot and mapping it. */
         if (!cng_scr[i].hi && scr_map(i) != 0)
             return -1;
@@ -655,16 +846,20 @@ static int cng_scratch_slot(long tid) {
  * So what the guest asked for is kept, per thread, for de_thread to read: a
  * thread that has asked for every signal to be blocked is, for a moment, left
  * alone and waited for, like the kernel's de_thread does for one already
- * exiting. It is a hint with a deadline (execve.c gives it a few milliseconds),
- * not a refusal: a thread that really does sit with everything blocked — the
- * sigwait thread of a daemon — is told after that as it always was. `how` and
+ * exiting. It is a hint with a deadline (execve.c gives it a few milliseconds,
+ * and up to a second while it is not asleep), not a refusal: a thread that
+ * really does sit with everything blocked — the sigwait thread of a daemon —
+ * is told after that as it always was. `how` and
  * `set` are the call's own; the SIGSYS tier, which computes the resulting mask,
  * passes it as a SETMASK. */
 void cng_sig_note_mask(int how, unsigned long set) {
-    int i = cng_scratch_slot(sys_gettid());
-    if (i < 0)
-        return;
     int full = (set | (1UL << (CNG_SIGSYS - 1))) == ~0UL;
+    int i = cng_scratch_slot(sys_gettid());
+    if (i < 0) {
+        if (full && how != 1 && cng_dethread_doomed())
+            cng_dethread_die();
+        return;
+    }
     int cur = __atomic_load_n(&cng_scr[i].sigfull, __ATOMIC_RELAXED);
     if (how == 2 /*SETMASK*/)
         cur = full;
@@ -672,7 +867,15 @@ void cng_sig_note_mask(int how, unsigned long set) {
         cur = 1;
     else if (how == 1 /*UNBLOCK*/ && set)
         cur = 0;
-    __atomic_store_n(&cng_scr[i].sigfull, cur, __ATOMIC_RELAXED);
+    /* The mask first, then whether an exec is killing this thread: de_thread
+     * says so first and reads the mask after, and the four are sequentially
+     * consistent, so one side always sees the other. A thread whose whole
+     * mask the exec read too early sees the exec, and exits here: it was
+     * told without its mask, and the request, sent microseconds after the
+     * read, used to be delivered as its unmap returned, onto no stack. */
+    __atomic_store_n(&cng_scr[i].sigfull, cur, __ATOMIC_SEQ_CST);
+    if (cur && cng_dethread_doomed())
+        cng_dethread_die();
 }
 
 /* Has thread `tid` asked for every signal to be blocked? Read by another thread
@@ -683,7 +886,7 @@ int cng_sig_all_blocked(long tid) {
         unsigned i = (h + k) % CNG_SCR_N;
         long t = __atomic_load_n(&cng_scr[i].tid, __ATOMIC_ACQUIRE);
         if (t == tid)
-            return __atomic_load_n(&cng_scr[i].sigfull, __ATOMIC_RELAXED);
+            return __atomic_load_n(&cng_scr[i].sigfull, __ATOMIC_SEQ_CST);
         if (t == 0)
             return 0;
     }
@@ -725,6 +928,7 @@ int cng_scratch_slot_for(long tid, unsigned long *hi_out) {
  * registered it is exactly the guest at risk. */
 int cng_g_sigsys_nest = 0;
 unsigned long cng_g_sigsys_frame[2];
+int cng_g_traps_live;
 
 static void sigsys_on_scratch(void *ucv, void *si) {
     struct cng_ucontext *uc = ucv;
@@ -800,20 +1004,194 @@ static void takeover_on_scratch(void *ucv, void *si) {
     cng_exec_takeover_frame(uc);
 }
 
+/* ---- a ptrace request carried by SIGSYS ----
+ *
+ * The kick that stops a running task for its tracer (PTRACE_ATTACH, SEIZE's
+ * INTERRUPT, a routed stop signal) is a real-time signal, and a thread can
+ * block it: GLib's worker threads block nearly everything, gmain among them.
+ * The kernel attaches with SIGSTOP, which no mask holds back, so a crashed
+ * Chrome's crashpad stopped every thread and the kick to gmain sat pending
+ * for good, the reporter waiting on it, the browser never exiting. SIGSYS is
+ * the one signal of ours a guest can never block, so a tracer whose target
+ * holds the kick blocked sends the request as a SIGSYS too (ptrace.c,
+ * pt_kick_attach), and it is taken here.
+ *
+ * Where it lands decides what can be done with it. In guest code, or in a
+ * stub or a dispatch running in guest context, the stop is taken at once, the
+ * same way the kick's handler takes one (cng_pt_sigsys_kick). Anywhere else
+ * in chroot-ng — a dispatch this handler is making, or one of our other
+ * handlers — the frame is ours and no stop can be taken on it, so the request
+ * is noted and left: the handler underneath takes it on its way out, a wait it
+ * polls ends for it (cng_sig_kick_pending), and the tracer sends it again
+ * while it is not taken.
+ *
+ * SIGSYS also costs something the kick does not: it is a standard signal, of
+ * which a thread holds one pending at most, so a trap the thread takes while
+ * ours is pending is merged into ours and lost — the kernel skips the call
+ * and hands the handler our siginfo instead. cng_pt_sigsys_kick makes such a
+ * call again, which takes knowing whether the call behind the frame trapped
+ * at all (cng_seccomp_traps) and whether a handler of ours answered it and
+ * just returned (the frame noted below). */
+static int sigsys_is_kick(const cng_siginfo_t *si) {
+    return si->si_code == -1 /*SI_QUEUE*/ &&
+           (int)si->_u._pad[1] == CNG_PT_KICK_ATTACH;
+}
+
+/* Note the frame a handler of ours is returning this thread to. */
+static void scr_note_back(int i, const struct cng_ucontext *uc) {
+    if (i < 0)
+        return;
+    const unsigned long long *r = uc->uc_mcontext.regs;
+    cng_scr[i].back.pc = uc->uc_mcontext.pc;
+    cng_scr[i].back.sp = uc->uc_mcontext.sp;
+    cng_scr[i].back.x0 = r[0];
+    cng_scr[i].back.x1 = r[1];
+    cng_scr[i].back.x2 = r[2];
+    cng_scr[i].back.x8 = r[8];
+    cng_scr[i].back.x30 = r[30];
+}
+
+void cng_sig_note_return(const struct cng_ucontext *uc) {
+    scr_note_back(cng_scratch_slot(sys_gettid()), uc);
+}
+
+void cng_sig_in_handler(int d) {
+    int i = cng_scratch_slot(sys_gettid());
+    if (i >= 0)
+        cng_scr[i].inh += d;
+}
+
+int cng_sig_take_deferred(void) {
+    int i = cng_scratch_slot(sys_gettid());
+    if (i < 0 || !cng_scr[i].attach)
+        return 0;
+    cng_scr[i].attach = 0;
+    return 1;
+}
+
+int cng_sig_returned_to(const struct cng_ucontext *uc) {
+    int i = cng_scratch_slot(sys_gettid());
+    if (i < 0)
+        return 0;
+    const unsigned long long *r = uc->uc_mcontext.regs;
+    return cng_scr[i].back.pc == uc->uc_mcontext.pc &&
+           cng_scr[i].back.sp == uc->uc_mcontext.sp &&
+           cng_scr[i].back.x0 == r[0] && cng_scr[i].back.x1 == r[1] &&
+           cng_scr[i].back.x2 == r[2] && cng_scr[i].back.x8 == r[8] &&
+           cng_scr[i].back.x30 == r[30];
+}
+
+/* ---- asking the kernel which of our filters this task carries ----
+ *
+ * The tag on a trap says which filter caught it (monitor.h), but the trap a
+ * SIGSYS of ours displaced left no tag: its siginfo is ours. A task that
+ * inherited a filter and has not trapped through it since has no record of
+ * it either. So the question is put to the kernel: a call that only the
+ * filter asked about traps, made from the probe's svc, outside the gate, and
+ * answered by the handler below without dispatching it. getppid for the
+ * tracee's filter, which traps every call: neither of the others traps it.
+ * waitid, with no state asked for, for the tracer's: only the tracee's traps
+ * it too, and natively it is EINVAL before it looks at anything else. A first
+ * argument the trap is merged into (another SIGSYS pending) comes back as it
+ * was, and is asked again; one an ambient filter refuses is not asked. */
+extern long cng_probe_svc(long a0, long nr);
+extern char cng_probe_ret[];
+#define PROBE_HIT    (-1000L) /* what the handler answers a probe's trap with */
+#define PROBE_MERGED (-1001L) /* the first argument: no answer was given */
+
+int cng_sig_filter_stacked(int tag) {
+    long nr = tag == CNG_TRAP_TAG_TRACEALL ? __NR_getppid : __NR_waitid;
+    if (!cng_g_traps_live || cng_blocked[nr])
+        return 0;
+    for (int k = 0; k < 8; k++) {
+        long r = cng_probe_svc(PROBE_MERGED, nr);
+        if (r != PROBE_MERGED)
+            return r == PROBE_HIT;
+    }
+    return 0;
+}
+
+/* Is `pc` in one of the bounce stubs, which run in guest context? */
+static int pc_in_stub(unsigned long pc) {
+    unsigned long w = (unsigned long)cng_bounce_wait,
+                  d = (unsigned long)cng_bounce_dispatch;
+    return pc == w || pc == w + 4 || pc == (unsigned long)__cng_gate_end ||
+           pc == (unsigned long)cng_bounce_svc_end || (pc >= d && pc <= d + 12);
+}
+
+/* The request, served on the scratch stack with the guest's alt-stack out of
+ * the way, as a dispatch is (sigsys_on_scratch). `direct` is non-null for one
+ * delivered straight onto the frame (see cng_pt_sigsys_kick). */
+static void kick_on_scratch(void *ucv, void *direct) {
+    struct cng_ucontext *uc = ucv;
+    if (uc->uc_stack.ss_size && !(uc->uc_stack.ss_flags & CNG_SS_DISABLE)) {
+        cng_stack_t off = {0, CNG_SS_DISABLE, 0};
+        CNG_SYS(__NR_sigaltstack, (long)&off, 0, 0, 0, 0, 0);
+    }
+    cng_pt_sigsys_kick(uc, direct != 0);
+}
+
+static void sigsys_kick(struct cng_ucontext *uc) {
+    int i = cng_scratch_slot(sys_gettid());
+    unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
+    /* Left for later: inside a dispatch this handler is making, inside the
+     * work of another handler of ours (one taking a stop, above all — a stop
+     * nested in it would be a second stop, its writes undone when that
+     * handler returns), or in any other code of ours but a dispatch running
+     * in guest context, which is where the kick's own stops are taken too. */
+    int later = i >= 0 && ((cng_scr[i].busy && cng_scr[i].uc) || cng_scr[i].inh);
+    if (!later && pc >= (unsigned long)__cng_image_start &&
+        pc < (unsigned long)__cng_image_end && !pc_in_stub(pc) &&
+        !(i >= 0 && cng_scr[i].gf))
+        later = 1;
+    if (later) {
+        if (i >= 0)
+            cng_scr[i].attach = 1;
+        return;
+    }
+    /* The first pass is the request itself, delivered onto this frame; a
+     * further one is a request left for it meanwhile, which displaced
+     * nothing here. */
+    int direct = 1;
+    do {
+        if (i >= 0)
+            cng_scr[i].attach = 0;
+        if (i >= 0 && !cng_scr[i].busy) {
+            cng_scr[i].busy = 1;
+            cng_scr[i].uc = uc;
+            cng_run_on_stack((void *)cng_scr[i].hi, (void *)kick_on_scratch, uc,
+                             direct ? (void *)1 : 0);
+            cng_scr[i].uc = 0;
+            cng_scr[i].busy = 0;
+        } else {
+            /* A dispatch from guest context holds the stack: in place, as the
+             * kick's handler serves one. */
+            if (i >= 0)
+                cng_scr[i].inh++;
+            cng_pt_sigsys_kick(uc, direct);
+            if (i >= 0)
+                cng_scr[i].inh--;
+        }
+        scr_note_back(i, uc);
+        direct = 0;
+    } while (i >= 0 && cng_scr[i].attach);
+}
+
 static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     (void)sig;
     /* A request from another thread of this process (execve.c's de_thread):
      * die here and now — wherever this thread was, in the guest or nested
      * inside a dispatch of its own — or carry the exec it planned. */
     void (*fn)(void *, void *) = sigsys_on_scratch;
-    switch (cng_dethread_request(si)) {
+    /* A sibling's exec is killing this thread: whatever this SIGSYS is, it is
+     * the request too. One sent while another SIGSYS was pending (a trap's)
+     * was merged into it, and execve.c tells a thread only once. */
+    int req = cng_dethread_request(si);
+    if (!req && cng_dethread_doomed())
+        req = CNG_DT_DIE;
+    switch (req) {
     case CNG_DT_DIE:
-        /* Killed by a sibling's exec, which is a SIGKILL from the kernel's
-         * de_thread: a tracer of this thread is shown that death, and the
-         * per-task ptrace state goes back with the task. */
-        cng_pt_exit_report(9 /*SIGKILL*/);
-        for (;;)
-            sys_exit(0);
+        cng_dethread_die(); /* killed by a sibling's exec */
     case CNG_DT_EXEC:
         fn = takeover_on_scratch;
         break;
@@ -825,8 +1203,20 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
          * installed may siglongjmp out and never come back, which a busy flag
          * or a disarmed alt-stack would not survive. It used to be consumed
          * here and nothing happened, where the default action is a core dump. */
+        /* A probe's trap (cng_sig_filter_stacked): answered, nothing more. */
+        if (si->si_code == CNG_SYS_SECCOMP &&
+            si->_u._sigsys.call_addr == (void *)cng_probe_ret) {
+            ((struct cng_ucontext *)ucv)->uc_mcontext.regs[0] =
+                (unsigned long long)PROBE_HIT;
+            return;
+        }
+        if (sigsys_is_kick(si)) {
+            sigsys_kick((struct cng_ucontext *)ucv);
+            return;
+        }
         if (si->si_code != CNG_SYS_SECCOMP) {
             cng_pt_deliver_sigsys(si, ucv);
+            cng_sig_note_return((struct cng_ucontext *)ucv);
             return;
         }
     }
@@ -850,6 +1240,15 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
     cng_scr[i].busy = 1;
     cng_scr[i].uc = (struct cng_ucontext *)ucv;
     cng_run_on_stack((void *)cng_scr[i].hi, (void *)fn, ucv, si);
+    scr_note_back(i, (struct cng_ucontext *)ucv);
+    /* A request that came in while this handler was busy (sigsys_kick): the
+     * frame is the guest's again, and it is taken on that, here. */
+    while (cng_scr[i].attach) {
+        cng_scr[i].attach = 0;
+        cng_run_on_stack((void *)cng_scr[i].hi, (void *)kick_on_scratch, ucv,
+                         0);
+        scr_note_back(i, (struct cng_ucontext *)ucv);
+    }
     cng_scr[i].uc = 0;
     cng_scr[i].busy = 0;
 }
@@ -875,9 +1274,46 @@ static void sigsys_handler(int sig, cng_siginfo_t *si, void *ucv) {
  * again overwrites those frames. The SP test is kept alongside for the direct
  * re-entry it does catch. Either way the nested call gets a stack of its own
  * rather than the guest's, which is the one thing the guest's cannot survive. */
+static int cng_run_scratch_on(int i, unsigned long sp, void (*fn)(void *),
+                              void *arg);
+
 int cng_run_scratch(void (*fn)(void *), void *arg) {
+    return cng_run_scratch_in(fn, arg, 0);
+}
+
+/* The record is published with a plain store: the only reader is a kick
+ * handler on this same thread, which a signal delivery orders after it. */
+int cng_run_scratch_in(void (*fn)(void *), void *arg, struct cng_gframe *f) {
     int i = cng_scratch_slot(sys_gettid());
     unsigned long sp = (unsigned long)&i;
+    if (f && i >= 0) {
+        f->prev = cng_scr[i].gf;
+        cng_scr[i].gf = f;
+    }
+    int ran = cng_run_scratch_on(i, sp, fn, arg);
+    if (f && i >= 0)
+        cng_scr[i].gf = f->prev;
+    return ran;
+}
+
+struct cng_gframe *cng_gframe_cur(void) {
+    long tid = sys_gettid();
+    unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
+    for (unsigned k = 0; k < CNG_SCR_N; k++) {
+        unsigned i = (h + k) % CNG_SCR_N;
+        long t = __atomic_load_n(&cng_scr[i].tid, __ATOMIC_ACQUIRE);
+        if (t == tid)
+            return cng_scr[i].gf;
+        if (t == 0)
+            return 0;
+    }
+    return 0;
+}
+
+/* The switch itself, for a slot already looked up (`i`, -1 for none) from a
+ * caller standing at `sp`. */
+static int cng_run_scratch_on(int i, unsigned long sp, void (*fn)(void *),
+                              void *arg) {
     if (i >= 0 && !cng_scr[i].busy &&
         !(sp >= cng_scr[i].lo && sp < cng_scr[i].hi)) {
         cng_scr[i].busy = 1;
@@ -969,21 +1405,41 @@ int cng_sig_deliverable_in(const struct cng_ucontext *uc) {
     return 0;
 }
 
-/* The same question for the frame this thread is in, found by its tid: for a
- * caller that is not handed one. */
-int cng_sig_deliverable(void) {
+/* Is a ptrace kick waiting for a wait made inside the handler to end — queued,
+ * and not blocked by the mask the frame will restore? A kick the guest's own
+ * mask holds back would not be delivered at the restart either. */
+int cng_sig_kick_pending(const struct cng_ucontext *uc) {
+    unsigned long pend = 0, bit = 1UL << (cng_g_kicksig - 1);
+    if (!uc)
+        return 0;
+    /* ...or one carried by SIGSYS, left for this handler (sigsys_kick). */
+    int i = cng_scratch_slot(sys_gettid());
+    if (i >= 0 && cng_scr[i].attach)
+        return 1;
+    if (uc->uc_sigmask.sig[0] & bit)
+        return 0;
+    return CNG_SYS(__NR_rt_sigpending, &pend, sizeof pend, 0, 0, 0, 0) == 0 &&
+           (pend & bit);
+}
+
+/* The frame the dispatch on this thread's scratch stack is running for, or 0
+ * when it is not in the handler. */
+static struct cng_ucontext *scr_cur_uc(void) {
     long tid = sys_gettid();
     unsigned h = (unsigned)((unsigned long)tid * 2654435761u) % CNG_SCR_N;
-    struct cng_ucontext *uc = 0;
     for (unsigned k = 0; k < CNG_SCR_N; k++) {
         unsigned i = (h + k) % CNG_SCR_N;
-        if (__atomic_load_n(&cng_scr[i].tid, __ATOMIC_ACQUIRE) == tid) {
-            uc = cng_scr[i].uc;
-            break;
-        }
+        if (__atomic_load_n(&cng_scr[i].tid, __ATOMIC_ACQUIRE) == tid)
+            return cng_scr[i].uc;
     }
-    return cng_sig_deliverable_in(uc);
+    return 0;
 }
+
+int cng_sig_kick_waiting(void) { return cng_sig_kick_pending(scr_cur_uc()); }
+
+/* The same question for the frame this thread is in, found by its tid: for a
+ * caller that is not handed one. */
+int cng_sig_deliverable(void) { return cng_sig_deliverable_in(scr_cur_uc()); }
 
 /* Testing: the SIGSYS handler on its own — no filter, no blocked-syscall probe,
  * no ptrace plumbing. Enough for a fabricated SIGSYS to reach the real handler

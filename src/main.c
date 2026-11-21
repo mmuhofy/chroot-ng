@@ -411,11 +411,13 @@ static void help(char **envp) {
                       "backing file where the host refuses link(2) (Android / "
                       "SELinux answers EACCES/EXDEV/EPERM). Backing files live "
                       "in a per-rootfs store '<rootfs>/.l2s', invisible to the "
-                      "guest; the group presents as ordinary regular files "
-                      "sharing one inode — across directories, through mv and "
-                      "rm — which lets package managers such as apk/dpkg "
-                      "unpack. Off by default: without it the host's refusal "
-                      "is reported to the guest unchanged."},
+                      "guest; the group presents as ordinary files sharing one "
+                      "inode — across directories, through mv and rm — which "
+                      "lets package managers such as apk/dpkg unpack. The "
+                      "hardlinks proot's own link2symlink made (a rootfs "
+                      "installed by proot-distro) are read and kept the way "
+                      "proot keeps them. Off by default: without it the host's "
+                      "refusal is reported to the guest unchanged."},
         {"-R, --rewrite", "Rewrite the guest's svc instruction sites to "
                       "trampolines: ahead of time where an object's section "
                       "headers say its code is, and on its first trap for a "
@@ -447,7 +449,10 @@ static void help(char **envp) {
                       "left out rather than listed and then refused — except "
                       "shm/, which where the host has no /dev/shm (Android) is "
                       "served from a per-uid directory under $TMPDIR, so the "
-                      "guest's shm_open/sem_open have somewhere to go. With "
+                      "guest's shm_open/sem_open have somewhere to go; a "
+                      "$TMPDIR that others can write (and is not sticky) will "
+                      "not do, and with no other temp directory to fall back "
+                      "on a warning says why the guest has no /dev/shm. With "
                       "this flag /dev is served from the rootfs (or a -b bind) "
                       "only."},
         {"    --no-proc", "Disable /proc emulation. By default the host /proc "
@@ -495,7 +500,8 @@ static void help(char **envp) {
                       "TIOCGWINSZ (a redirected run). Clamped to 32..92; a "
                       "value that is not a positive number is ignored."},
         {"CNG_DEBUG", "When set to a non-empty, non-zero value, log verbose "
-                      "syscall-error diagnostics to stderr."},
+                      "syscall-error diagnostics to stderr, including each "
+                      "syscall the host refuses and chroot-ng emulates."},
         {"CNG_L2S_FORCE", "With -l: route every linkat through the emulation "
                       "without trying the real hardlink first. Test aid for "
                       "hosts whose filesystem allows link(2)."},
@@ -519,8 +525,15 @@ static void help(char **envp) {
                       "reaches that only with 256 threads live at once."},
         {"CNG_DEVSHM_FORCE_TMP", "Serve the guest's /dev/shm from the per-uid "
                       "directory under $TMPDIR even where the host has a real "
-                      "/dev/shm. Test aid: a host that has one otherwise never "
-                      "takes the stand-in path at all."},
+                      "/dev/shm; where none can be made the guest has no "
+                      "/dev/shm, as on a device. Test aid: a host that has "
+                      "one otherwise never takes the stand-in path at all."},
+        {"CNG_TMP_ENV_ONLY", "Look for chroot-ng's private temp directories "
+                      "(the /dev/shm stand-in, read-only /proc views) only "
+                      "under $TMPDIR and $XDG_RUNTIME_DIR, passing over "
+                      "/data/local/tmp and /tmp. Test aid: a host whose /tmp "
+                      "would serve never sees what an Android app with an "
+                      "unusable $TMPDIR does."},
         {"CNG_PROCSTAT_SYNTH", "Serve /proc/stat from the synthesized "
                       "fallback even where the host file is readable. Test "
                       "aid: Android's SELinux policy denies it, which is the "
@@ -535,6 +548,12 @@ static void help(char **envp) {
                       "the guest's view as if the host kernel had refused "
                       "them, which Android's SELinux policy does. Test aid: "
                       "a host that allows them never takes that path."},
+        {"CNG_PROCFS_REOPEN_DENY", "Take the reopen that makes a synthesized "
+                      "/proc file read-only as refused, as Android's SELinux "
+                      "policy refuses an app the reopen of a memfd, so the "
+                      "read-only view is served from a file in a private "
+                      "directory under $TMPDIR. Test aid: a host that allows "
+                      "the reopen never takes that path."},
         {"CNG_TERMIOS2_DENY", "Refuse the termios2 ioctls (TCGETS2, TCSETS2, "
                       "...) with EACCES before the host is asked, as "
                       "Android's policy does, so they are served from "
@@ -546,6 +565,29 @@ static void help(char **envp) {
                       "the host is asked, as Android's policy does on a pty "
                       "slave and a pipe, so it is served from TCGETS, "
                       "TIOCGPGRP and getsid. Test aid: a host that serves it "
+                      "never takes that path."},
+        {"CNG_TCSETSF_DENY", "Refuse TCSETSF (tcsetattr with TCSAFLUSH) with "
+                      "EACCES before the host is asked, as Android 8's "
+                      "policy does on a pty, so it is served from TCFLSH and "
+                      "TCSETSW -- and so is TCSETSF2. Test aid: a host that "
+                      "serves it never takes that path."},
+        {"CNG_SETID_DENY", "Without -u, take setuid, setgid, setreuid, "
+                      "setregid, setresgid, setfsuid, setfsgid and setgroups "
+                      "as refused by the host, as Android's app filter "
+                      "refuses them, so they are answered from the real ids "
+                      "and capabilities the way the kernel would answer "
+                      "them. Test aid: a host that allows them never takes "
+                      "that path."},
+        {"CNG_OPENAT2_DENY", "Take openat2 as refused by the host, as "
+                      "Android's app filter refuses it, so chroot-ng never "
+                      "issues it itself and a guest's openat2 is emulated "
+                      "-- as it is on a kernel without one. Test aid: a host "
+                      "that allows it never takes that path."},
+        {"CNG_MM_MAP_DENY", "Take PR_SET_MM_MAP as refused by the host, as "
+                      "Android's kernels refuse it, so the kernel's own record "
+                      "of a guest process's argv and environment is left alone "
+                      "and /proc/<pid>/cmdline and environ are read out of "
+                      "guest memory instead. Test aid: a host that allows it "
                       "never takes that path."},
         {"CNG_BROKER_NO_PEERCRED", "Behave as if the kernel would not say who "
                       "is on the other end of the IPC broker's rendezvous "

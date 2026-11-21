@@ -92,7 +92,9 @@ static inline struct cng_uregs *cng_pt_uregs(struct cng_ucontext *uc) {
  * CAP_SYS_ADMIN, which the guest holds under fake-root; it suspends the
  * tracee's own filters, of which it has none it can see. A host kernel built
  * without checkpoint/restore support does not know the option at all, and the
- * emulation then answers it EINVAL as that kernel does. */
+ * emulation then answers it EINVAL as that kernel does; one before 4.3 has no
+ * such bit, and the emulation refuses it as that kernel refuses a bit outside
+ * its mask (EIO from SEIZE, EINVAL from SETOPTIONS). */
 #define CNG_PTRACE_O_TRACESYSGOOD    0x0001
 #define CNG_PTRACE_O_TRACEFORK       0x0002
 #define CNG_PTRACE_O_TRACEVFORK      0x0004
@@ -132,10 +134,15 @@ static inline struct cng_uregs *cng_pt_uregs(struct cng_ucontext *uc) {
  * tracer's own interception). SIGRTMAX: glibc claims SIGRTMIN..SIGRTMIN+2 and
  * Go preempts with SIGURG, so the top of the RT range is the quietest slot.
  * A guest-directed signal of the same number is told apart by the magic in
- * si_value and forwarded to the guest's own handler. */
+ * si_value and forwarded to the guest's own handler. A thread can block it,
+ * where the kernel's attach is a SIGSTOP nothing blocks, so a request of the
+ * ATTACH kind to a thread that holds it blocked goes as a SIGSYS of ours as
+ * well, with the same magic (ptrace.c pt_kick_attach, sigsys.c sigsys_kick). */
 #define CNG_PT_KICKSIG   64 /* the intent; cng_g_kicksig is what is used */
 #define CNG_PT_KICK_ATTACH 0x50544b21 /* "PTK!" — adopt attach/interrupt/stopsig */
-#define CNG_PT_KICK_WAKE   0x50545721 /* "PTW!" — no-op; EINTRs a blocked wait */
+#define CNG_PT_KICK_WAKE   0x50545721 /* "PTW!" — no-op; ends a native wait */
+#define CNG_PT_KICK_REWAKE 0x50545221 /* "PTR!" — WAKE again, for a stop still
+                                       * uncollected after a while */
 #define CNG_PT_KICK_ARM    0x50544121 /* "PTA!" — install the tracer filter here */
 
 /* --no-ptrace: refuse guest ptrace outright (-EPERM) and keep the registry
@@ -170,6 +177,13 @@ int cng_pt_syscall_entry(struct cng_uregs *r, long *nr_out);
 /* Syscall-exit stop, with `r->x[0]` already holding the result. The tracer may
  * overwrite it, so the caller must not touch x0 afterwards. */
 void cng_pt_syscall_exit(struct cng_uregs *r);
+
+/* Is an exit stop owed — was the entry stop of the call in flight reported?
+ * And the same put back, by a caller that kept it across a call that blocked:
+ * a guest handler can run on top of such a call, and the stops of its own
+ * syscalls settle the flag for theirs. */
+int cng_pt_entry_owed(void);
+void cng_pt_entry_set(int owed);
 
 /* Post-execve stop (PTRACE_EVENT_EXEC, or a plain SIGTRAP without the option).
  * Called by the emulated execve once the new image is in place. */
@@ -214,8 +228,9 @@ int cng_pt_report_signal(struct cng_uregs *r, int sig, int si_code, u64 addr);
 
 /* The kick signal arrived (see CNG_PT_KICK_*): adopt a pending attach, service
  * a pending PTRACE_INTERRUPT or a cooperative group-stop. Called from the
- * kick handler with the interrupted context. */
-void cng_pt_service_kick(struct cng_uregs *r);
+ * kick handler with its signal frame, which the stop then reads and writes —
+ * the general registers and the FP/SIMD state both. */
+void cng_pt_service_kick(struct cng_ucontext *uc);
 
 /* Queue the reserved kick signal at one task with one of the CNG_PT_KICK_*
  * magics in si_value. */
@@ -223,10 +238,11 @@ void cng_pt_kick(s32 tgid, s32 tid, int magic);
 
 /* Record the register frame this entry into monitor code is running on, and
  * the signal frame it came from when there is one (an -R trampoline has none,
- * and answers NT_PRFPREG with -EINVAL). Every entry point that can reach a stop
- * sets it; the wait and exit paths read it back for the guest's signal mask and
- * for the registers of an exit stop. Both are no-ops, and both read back NULL,
- * until something in the process takes on a ptrace role. */
+ * and its stops read and write the FP/SIMD registers live). Every entry point
+ * that can reach a stop sets it; the wait and exit paths read it back for the
+ * guest's signal mask and for the registers of an exit stop. Both are no-ops,
+ * and both read back NULL, until something in the process takes on a ptrace
+ * role. */
 void cng_pt_set_frame(struct cng_uregs *r, struct cng_ucontext *uc);
 struct cng_uregs *cng_pt_cur_regs(void);
 struct cng_ucontext *cng_pt_cur_uc(void);
@@ -247,6 +263,36 @@ long cng_pt_wait4(long pid, u64 status, long options, u64 rusage,
                   const struct cng_ucontext *uc);
 long cng_pt_waitid(long idtype, long id, u64 infop, long options, u64 rusage,
                    const struct cng_ucontext *uc);
+
+/* The -R tier's wait4/waitid (`nr`, guest arguments a0..a4) for a process that
+ * cannot be owed an emulated stop — it has never been a tracer and nothing
+ * names it as one: made by the kernel as the guest issued it, on the guest's
+ * own mask, so it returns the moment a child does. The wait above, which has
+ * to poll the registry, cost every -R wait up to its 50 ms slice — a shell's
+ * every fork and waitpid. Returns 1 with the result in *out, or 0 for the
+ * caller to use the wait above: a tracer, the kick blocked, or a kick that
+ * made this process a tracer while it slept (cng_pt_kick_taken). Only for the
+ * trampoline tier: from the SIGSYS handler every signal is masked. */
+int cng_pt_wait_native(long nr, long a0, long a1, long a2, long a3, long a4,
+                       long *out);
+/* Test aid: when set, run in a blocking native wait after its look at the
+ * registry and before its svc, which is where a kick has to be caught by the
+ * compare rather than by the svc's EINTR (-t ptracetest). */
+extern void (*cng_g_wait_native_probe)(void);
+
+/* The kick handler's report of a kick of ours (`magic`) it took, with the
+ * frame it interrupted: what ends a native wait, see cng_wait_unless. */
+void cng_pt_kick_taken(struct cng_ucontext *uc, int magic);
+/* ...and, for every kick, a bounced wait it cut short with EINTR that the
+ * kernel would have restarted (an attach is a stop, not a delivery), put back
+ * to be made again (cng_bounce_unwind), after the exit stop it owes. */
+void cng_pt_kick_unwind(struct cng_ucontext *uc);
+/* A request of the kick's kind carried by SIGSYS, to a thread that held the
+ * kick blocked (sigsys.c), on the frame it interrupted: a trap it displaced is
+ * made again when it was delivered `direct`ly onto that frame, and the stops
+ * are taken as the kick's handler takes them. A request left for a handler of
+ * ours and taken by it on its own frame is not direct. */
+void cng_pt_sigsys_kick(struct cng_ucontext *uc, int direct);
 
 /* process_vm_readv/writev where the peer is one of our stopped tracees: served
  * over the mailbox, because the host may refuse the real thing. `flags` is the
@@ -274,6 +320,12 @@ void cng_pt_arm_tracee(void);
  * default case must then re-issue an unhandled syscall instead of reading it as
  * "Android blocked this one". */
 int cng_pt_traceall(void);
+
+/* A trap with `tag` (si_errno, CNG_TRAP_TAG_* in monitor.h) was just taken on
+ * this task: the filter that tagged it is stacked here, recorded so for the
+ * questions above even where this task did not stack it itself (see the tag).
+ * Anything else is no news. */
+void cng_pt_note_trap(int tag);
 
 /* ---- single-step (ptstep.c) ---- */
 /* One step in flight, per task: the breakpoint planted at the instruction the
@@ -324,8 +376,11 @@ void cng_pt_sig_trace_leave(void);
 /* Install the kick handler. Called once per process at monitor install, and
  * again after the emulated execve resets dispositions. cng_pt_pick_kicksig
  * settles which signal number that is (see cng_g_kicksig) — SIGRTMAX where it
- * can be queued, the first lower one that can be otherwise. */
+ * can be queued, the first lower one that can be otherwise. cng_g_kick_live
+ * says one was actually delivered; without it nothing that waits on a kick to
+ * be woken can be left to sleep in the kernel (cng_pt_wait_native). */
 extern int cng_g_kicksig;
+extern int cng_g_kick_live;
 void cng_pt_sig_install_kick(void);
 void cng_pt_pick_kicksig(void);
 /* The emulated execve's counterpart to the kernel resetting dispositions:

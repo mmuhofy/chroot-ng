@@ -21,7 +21,13 @@ struct proc_ent {
     char auxv[CNG_PROCREG_AUXV];    /* raw guest auxv block */
     char exe[CNG_PROCREG_PATH];     /* canonical guest exe path */
     char cwd[CNG_PROCREG_PATH];     /* canonical guest cwd */
+    struct cng_procargs args;       /* where cmd/env live in its memory */
+    struct cng_procids ids;         /* who it is to a socket peer */
+    u32 ngroups;                    /* ...and its supplementary groups */
+    u32 groups[CNG_PROCREG_GROUPS];
 };
+_Static_assert(CNG_PROCREG_GROUPS == CNG_NGROUPS_MAX,
+               "the registry holds every group the fake set can");
 
 /* The claim array is kept apart from the payload, because it is what every
  * lookup walks. "Is this pid a guest?" is asked for each numeric name in a
@@ -57,17 +63,10 @@ typedef u64 __attribute__((__may_alias__)) pid_pair;
 static int g_hint_slot = -1;
 static int g_hint_pid;
 
-static int slot_of(int pid) {
-    if (!g_tab || pid <= 0)
-        return -1;
+/* The scan itself: the first slot holding `pid`, past the remembered one. */
+static int scan_for(int pid) {
     const s32 *tab = g_tab->pid;
     int n = g_tab_n;
-    int h = __atomic_load_n(&g_hint_slot, __ATOMIC_RELAXED);
-    if (h >= 0 && h < n && __atomic_load_n(&g_hint_pid, __ATOMIC_RELAXED) == pid &&
-        __atomic_load_n(&tab[h], __ATOMIC_RELAXED) == pid) {
-        __atomic_thread_fence(__ATOMIC_ACQUIRE);
-        return h;
-    }
     int i = 0, found = -1;
     for (; i + 1 < n; i += 2) {
         u64 w = __atomic_load_n((const pid_pair *)&tab[i], __ATOMIC_RELAXED);
@@ -82,6 +81,20 @@ static int slot_of(int pid) {
     }
     if (found < 0 && i < n && __atomic_load_n(&tab[i], __ATOMIC_RELAXED) == pid)
         found = i; /* an odd slot count: the last one on its own */
+    return found;
+}
+
+static int slot_of(int pid) {
+    if (!g_tab || pid <= 0)
+        return -1;
+    int h = __atomic_load_n(&g_hint_slot, __ATOMIC_RELAXED);
+    if (h >= 0 && h < g_tab_n &&
+        __atomic_load_n(&g_hint_pid, __ATOMIC_RELAXED) == pid &&
+        __atomic_load_n(&g_tab->pid[h], __ATOMIC_RELAXED) == pid) {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        return h;
+    }
+    int found = scan_for(pid);
     if (found < 0)
         return -1;
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -222,6 +235,10 @@ int cng_proc_tgid(int tid) {
 
 int cng_procreg_has_task(int tid) {
     if (cng_procreg_has(tid))
+        return 1;
+    /* A thread of our own costs one probe rather than a status read: raise(3)
+     * and pthread_kill(3) under musl name one with every tkill. */
+    if (tid > 0 && CNG_SYS(__NR_tgkill, sys_getpid(), tid, 0, 0, 0, 0) == 0)
         return 1;
     int tgid = cng_proc_tgid(tid);
     return tgid > 0 && tgid != tid && cng_procreg_has(tgid);
@@ -394,7 +411,7 @@ static int open_shared_file(const char *key, unsigned long size) {
         return 0;
     char path[CNG_PATH_MAX + 64];
     size_t n = cng_snprintf(path, sizeof path,
-                            "%s/chroot-ng-procreg.v2.%u.%016llx", dir,
+                            "%s/chroot-ng-procreg.v4.%u.%016llx", dir,
                             (unsigned)sys_getuid(),
                             (unsigned long long)cng_broker_key_hash(key));
     if (n >= sizeof path)
@@ -563,6 +580,28 @@ static u32 join_vec(char *dst, u32 cap, char **vec) {
     return n;
 }
 
+/* Our ids as the live fake set has them, with no claim made under them, and
+ * with them, when `groups` is not NULL, its groups: their count is returned. */
+static u32 ids_live(struct cng_procids *p, u32 *groups) {
+    struct cng_cred_ids id;
+    int n = 0;
+    if (groups)
+        n = cng_cred_groups(groups, &id);
+    else
+        cng_cred_ids(&id);
+    memset(p, 0, sizeof *p);
+    p->fake = cng_g_fake_id ? 1 : 0;
+    p->ruid = id.ruid;
+    p->euid = id.euid;
+    p->suid = id.suid;
+    p->fsuid = id.fsuid;
+    p->rgid = id.rgid;
+    p->egid = id.egid;
+    p->sgid = id.sgid;
+    p->fsgid = id.fsgid;
+    return (u32)n;
+}
+
 static u16 copy_path(char *dst, u32 cap, const char *s) {
     if (!s)
         return 0;
@@ -574,8 +613,8 @@ static u16 copy_path(char *dst, u32 cap, const char *s) {
 }
 
 void cng_procreg_publish(char **argv, char **envp, const void *auxv,
-                         unsigned auxv_len, const char *exe_guest,
-                         const char *cwd_guest) {
+                         unsigned auxv_len, const struct cng_procargs *args,
+                         const char *exe_guest, const char *cwd_guest) {
     /* Sampled before the write window so the critical section is syscall-free
      * (a smaller kill-safe window, and nothing slow under the odd count). */
     u64 start = cng_proc_starttime((int)sys_getpid(), 0);
@@ -604,31 +643,49 @@ void cng_procreg_publish(char **argv, char **envp, const void *auxv,
         memcpy(e->auxv, auxv, auxv_len);
     e->exe_len = copy_path(e->exe, CNG_PROCREG_PATH, exe_guest);
     e->cwd_len = copy_path(e->cwd, CNG_PROCREG_PATH, cwd_guest);
+    if (args)
+        e->args = *args;
+    else
+        memset(&e->args, 0, sizeof e->args);
+    /* The ids and groups go straight into the slot: the set is read without
+     * a syscall. */
+    e->ngroups = ids_live(&e->ids, e->groups);
     seq_release(e, s);
 }
 
-void cng_procreg_fork(int child) {
-    if (!g_tab || child <= 0)
+/* Copy the forking process's entry into its child's slot: the parent's job,
+ * done once its clone returns, and the child's fallback when the parent does
+ * not get there (cng_procreg_fork_child). */
+static void fork_copy(int forker, int child) {
+    if (!g_tab || forker <= 0 || child <= 0)
         return;
-    struct cng_procsnap snap;
-    if (!cng_procreg_get((int)sys_getpid(), &snap))
-        return; /* we are not registered: nothing to inherit */
     /* The child may not be scheduled yet, but its stat file exists the moment
-     * clone() returns, so its starttime is already readable. */
+     * clone() returns, so its starttime is already readable from either side.
+     *
+     * The child itself may have beaten us here: it publishes its own identity
+     * when it loads a program, and that is newer than this forked copy (as is
+     * the same copy, written by a child that gave up waiting for its parent).
+     * A slot already stamped with the child's live starttime is its work —
+     * leave it. That is asked again once the lock is ours, since it may have
+     * been written in between. Failing to take the lock means the same thing
+     * (the child is the only other writer of its slot), so back off there
+     * too. */
+    struct cng_procsnap snap;
+    if (!cng_procreg_get(forker, &snap))
+        return; /* the forker is not registered: nothing to inherit */
     u64 start = cng_proc_starttime(child, 0);
     struct proc_ent *e = slot_for(child);
     if (!e)
         return;
-    /* The child itself may have beaten us here: it publishes its own identity
-     * when it loads a program, and that is newer than this forked copy. A slot
-     * already stamped with the child's live starttime is its work — leave it.
-     * Failing to take the lock means the same thing (the child is the only
-     * other writer of its slot), so back off there too. */
     if (start && __atomic_load_n(&e->start, __ATOMIC_ACQUIRE) == start)
         return;
     u32 s = seq_acquire(e, 4096);
     if (!s)
         return;
+    if (start && e->start == start) {
+        seq_release(e, s);
+        return;
+    }
     e->start = start;
     e->cmd_len = snap.cmd_len;
     e->env_len = snap.env_len;
@@ -640,7 +697,85 @@ void cng_procreg_fork(int child) {
     memcpy(e->auxv, snap.auxv, snap.auxv_len);
     memcpy(e->exe, snap.exe, snap.exe_len);
     memcpy(e->cwd, snap.cwd, snap.cwd_len);
+    /* The child's memory is a copy of ours, the strings at the same addresses,
+     * and the kernel's record of them is inherited with it. */
+    e->args = snap.args;
+    /* So are its credentials. A claim is the sender's own. */
+    e->ids = snap.ids;
+    e->ids.claim = 0;
+    e->ngroups = snap.ngroups;
+    memcpy(e->groups, snap.groups, snap.ngroups * sizeof *e->groups);
     seq_release(e, s);
+}
+
+void cng_procreg_fork(int child) {
+    fork_copy((int)sys_getpid(), child);
+}
+
+/* Is `pid`'s slot stamped with `start`, and not in the middle of a write? */
+static int fork_published(int pid, u64 start) {
+    int i = slot_of(pid);
+    if (i < 0)
+        return 0;
+    struct proc_ent *e = &g_tab->ent[i];
+    u32 s1 = __atomic_load_n(&e->seq, __ATOMIC_ACQUIRE);
+    if (s1 & 1)
+        return 0;
+    u64 st = __atomic_load_n(&e->start, __ATOMIC_ACQUIRE);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return st == start && __atomic_load_n(&e->seq, __ATOMIC_RELAXED) == s1;
+}
+
+/* Wait for the parent's copy rather than write one of our own alongside it:
+ * the two halves would each claim a free slot as often as not, since neither
+ * would yet see the other's, and leave the process holding two. A parent the
+ * scheduler gets back to is what is waited for — first by yielding to it,
+ * then in 1 ms naps up to about a tenth of a second. One that will not be
+ * coming (it died, a stop holds it longer than that, or the registry had no
+ * slot for us) leaves the copy to us. The bound is only the price of that
+ * last case, never what correctness rests on: a copy of our own is still
+ * the right one, it just risks a second slot. */
+#define FORK_WAIT_YIELDS 64
+#define FORK_WAIT_NAPS   100
+
+static void fork_wait(int forker) {
+    if (!g_tab || forker <= 0)
+        return;
+    int me = (int)sys_getpid();
+    u64 start = cng_proc_starttime(me, 0);
+    if (!start)
+        return; /* no stamp to recognize the parent's copy by, nor to write */
+    /* A parent with no entry of its own publishes nothing, and has nothing
+     * for us to copy either: waiting for it would only delay every fork. Its
+     * starttime is not asked (it has just forked us, so the pid is its own),
+     * which keeps this to the one /proc read our own stamp needs. */
+    int fi = slot_of(forker);
+    if (fi < 0 || !__atomic_load_n(&g_tab->ent[fi].start, __ATOMIC_ACQUIRE))
+        return;
+    for (int t = 0; t < FORK_WAIT_YIELDS + FORK_WAIT_NAPS; t++) {
+        if (fork_published(me, start))
+            return;
+        if (t < FORK_WAIT_YIELDS) {
+            CNG_SYS(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+            continue;
+        }
+        int zombie = 0;
+        if (!((t - FORK_WAIT_YIELDS) % 16) &&
+            (!cng_proc_starttime(forker, &zombie) || zombie))
+            break; /* the parent is gone: nobody else will write it */
+        struct cng_timespec nap = {0, 1000000};
+        CNG_SYS(__NR_nanosleep, &nap, 0, 0, 0, 0, 0);
+    }
+    fork_copy(forker, me);
+}
+
+void cng_procreg_fork_child(int forker) {
+    fork_wait(forker);
+    /* The copy names the ids and groups the forker had when it made it, and
+     * they are the child's only if no other thread of the forker changed them
+     * after the clone: the child's are the set it inherited, which it has
+     * here. */
+    cng_procreg_set_ids();
 }
 
 void cng_procreg_set_cwd(const char *cwd_guest) {
@@ -654,6 +789,54 @@ void cng_procreg_set_cwd(const char *cwd_guest) {
     if (!s)
         return; /* contended refresh: the next chdir writes the live value */
     e->cwd_len = copy_path(e->cwd, CNG_PROCREG_PATH, cwd_guest);
+    seq_release(e, s);
+}
+
+/* Our own slot locked for a write, for the small updates below; 0 when there
+ * is no slot or the lock could not be had. Every other writer of our slot
+ * holds it for a few stores (only the forking parent ever writes another
+ * process's), so the spin is long: a write given up leaves ids stale until
+ * the next change. */
+static struct proc_ent *own_write(u32 *s) {
+    if (!g_tab)
+        return 0;
+    int slot = slot_of((int)sys_getpid());
+    if (slot < 0)
+        return 0;
+    struct proc_ent *e = &g_tab->ent[slot];
+    *s = seq_acquire(e, 1 << 20);
+    return *s ? e : 0;
+}
+
+void cng_procreg_set_ids(void) {
+    u32 s;
+    struct proc_ent *e = own_write(&s);
+    if (!e)
+        return;
+    /* Read into the slot under its lock, as publish() does: syscall-free. */
+    e->ngroups = ids_live(&e->ids, e->groups);
+    seq_release(e, s);
+}
+
+void cng_procreg_claim(unsigned uid, unsigned gid) {
+    if (!g_tab)
+        return;
+    int slot = slot_of((int)sys_getpid());
+    if (slot < 0)
+        return;
+    struct proc_ent *e = &g_tab->ent[slot];
+    /* GLib claims the same ids before every authentication: one that is
+     * recorded already costs no write to the shared page. */
+    if (__atomic_load_n(&e->ids.claim, __ATOMIC_RELAXED) &&
+        __atomic_load_n(&e->ids.claim_uid, __ATOMIC_RELAXED) == uid &&
+        __atomic_load_n(&e->ids.claim_gid, __ATOMIC_RELAXED) == gid)
+        return;
+    u32 s;
+    if (!(e = own_write(&s)))
+        return;
+    e->ids.claim = 1;
+    e->ids.claim_uid = uid;
+    e->ids.claim_gid = gid;
     seq_release(e, s);
 }
 
@@ -686,6 +869,22 @@ int cng_procreg_has(int pid) {
     return 1;
 }
 
+int cng_procreg_slots(void) {
+    return g_tab ? g_tab_n : 0;
+}
+
+int cng_procreg_pid_at(int i) {
+    if (!g_tab || i < 0 || i >= g_tab_n)
+        return 0;
+    s32 pid = __atomic_load_n(&g_tab->pid[i], __ATOMIC_ACQUIRE);
+    /* Two slots can hold one pid — a forking parent and its exec'ing child
+     * each claim one when neither sees the other's yet — and a walk is to
+     * visit a process once: at the first of them. */
+    if (pid <= 0 || scan_for(pid) != i)
+        return 0;
+    return cng_procreg_has(pid) ? pid : 0;
+}
+
 int cng_procreg_get(int pid, struct cng_procsnap *out) {
     int slot = slot_of(pid);
     if (slot < 0)
@@ -716,6 +915,13 @@ int cng_procreg_get(int pid, struct cng_procsnap *out) {
         memcpy(out->auxv, e->auxv, al);
         memcpy(out->exe, e->exe, xl);
         memcpy(out->cwd, e->cwd, wl);
+        out->args = e->args;
+        out->ids = e->ids;
+        u32 ng = e->ngroups;
+        if (ng > CNG_PROCREG_GROUPS)
+            ng = CNG_PROCREG_GROUPS;
+        memcpy(out->groups, e->groups, ng * sizeof *out->groups);
+        out->ngroups = ng;
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) != s1)
             continue; /* torn read: retry */
@@ -735,4 +941,68 @@ int cng_procreg_get(int pid, struct cng_procsnap *out) {
         return 1;
     }
     return 0;
+}
+
+int cng_procreg_args(int pid, struct cng_procargs *out) {
+    int slot = slot_of(pid);
+    if (slot < 0)
+        return 0;
+    struct proc_ent *e = &g_tab->ent[slot];
+    for (int tries = 0; tries < 100; tries++) {
+        u32 s1 = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
+        if (s1 & 1)
+            continue; /* writer active */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&g_tab->pid[slot], __ATOMIC_RELAXED) != pid)
+            return 0; /* slot recycled under us */
+        *out = e->args;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) == s1)
+            return 1;
+    }
+    return 0;
+}
+
+int cng_procreg_ids(int pid, struct cng_procids *out) {
+    return cng_procreg_cred(pid, out, 0, 0);
+}
+
+int cng_procreg_cred(int pid, struct cng_procids *out, u32 *groups,
+                     u32 *ngroups) {
+    int self = pid == (int)sys_getpid();
+    int slot = slot_of(pid);
+    if (slot >= 0) {
+        struct proc_ent *e = &g_tab->ent[slot];
+        for (int tries = 0; tries < 100; tries++) {
+            u32 s1 = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
+            if (s1 & 1)
+                continue; /* writer active */
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (__atomic_load_n(&g_tab->pid[slot], __ATOMIC_RELAXED) != pid)
+                break; /* slot recycled under us */
+            u64 start = e->start;
+            *out = e->ids;
+            if (groups) {
+                u32 ng = e->ngroups;
+                if (ng > CNG_PROCREG_GROUPS)
+                    ng = CNG_PROCREG_GROUPS;
+                memcpy(groups, e->groups, ng * sizeof *groups);
+                *ngroups = ng;
+            }
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (__atomic_load_n(&e->seq, __ATOMIC_RELAXED) != s1)
+                continue; /* torn read: retry */
+            /* The pid-reuse guard, as cng_procreg_get applies it. */
+            if (self || (start && start == cng_proc_starttime(pid, 0)))
+                return 1;
+            break;
+        }
+    }
+    if (!self)
+        return 0;
+    /* No registry, or no entry of ours in it. */
+    u32 ng = ids_live(out, groups);
+    if (groups)
+        *ngroups = ng;
+    return 1;
 }

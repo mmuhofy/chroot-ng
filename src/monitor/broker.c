@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright 2026 Sylirre */
 /* Unified IPC broker (see include/cng/broker.h): the rendezvous, the transport,
- * the detached daemon, and — daemon-side — the System V shared-memory registry.
+ * the detached daemon, and — daemon-side — the System V shared-memory registry,
+ * with the libandroid-shmem door that lets host processes attach its segments.
  *
  * Ported from arm64chroot's proctab.c. Freestanding throughout: raw syscalls
  * through the gate, no allocator, no libc. Every field of the segment table
@@ -18,6 +19,7 @@
 #include "cng/ipcreg.h"
 #include "cng/loader.h"
 #include "cng/monitor.h"
+#include "cng/netlink.h"
 #include "cng/ownmap.h"
 #include "cng/path.h"
 #include "cng/procreg.h"
@@ -88,7 +90,10 @@ u64 cng_broker_hash(const void *p, unsigned long n) {
  * The version tag covers the request protocol AND struct proc_ent's layout:
  * bump it if either changes, so a differently versioned build never joins an
  * incompatible daemon. (v2 added the semaphore and message-queue operations,
- * which widened struct cng_breq; v3 added the hello, and widened the hash.) */
+ * which widened struct cng_breq; v3 added the hello, and widened the hash; v4
+ * the netlink sockets, and a descriptor riding with a request; v5 the ids a
+ * process publishes, and the argv and environ ranges, which were added
+ * without a bump; v6 the rest of its ids, and its groups.) */
 struct broker_ns {
     struct cng_sockaddr_un addr;
     unsigned alen;
@@ -103,13 +108,13 @@ static void broker_ns(struct broker_ns *ns, const char *rootfs, u64 sess) {
     size_t n;
     if (sess) {
         n = cng_snprintf(a->path + 1, sizeof a->path - 1,
-                         "cng-ipc.v3.%u.s%016llx", (unsigned)sys_getuid(),
+                         "cng-ipc.v6.%u.s%016llx", (unsigned)sys_getuid(),
                          (unsigned long long)sess);
         cng_snprintf(ns->key, sizeof ns->key, "%016llx",
                      (unsigned long long)sess);
     } else {
         n = cng_snprintf(a->path + 1, sizeof a->path - 1,
-                         "cng-ipc.v3.%u.%016llx", (unsigned)sys_getuid(),
+                         "cng-ipc.v6.%u.%016llx", (unsigned)sys_getuid(),
                          (unsigned long long)cng_broker_key_hash(rootfs));
         cng_strlcpy(ns->key, rootfs, sizeof ns->key);
     }
@@ -360,7 +365,7 @@ int cng_broker_recv(int sock, void *data, unsigned len, int *fd_out) {
             /* The ancillary fd arrived with the first byte, so a message that
              * fails to complete has already installed one — and host fd ==
              * guest fd here, so leaving it open hands the guest a descriptor
-             * onto whatever it named (a segment's backing memfd). The peer
+             * onto whatever it named (a segment's backing fd). The peer
              * dying mid-message and the 2 s SO_RCVTIMEO both land here. */
             if (fd_out && *fd_out >= 0) {
                 sys_close(*fd_out);
@@ -416,7 +421,7 @@ struct seg {
     u32 uid, gid, cuid, cgid;
     s32 cpid, lpid;
     s64 atime, dtime, ctime;
-    int memfd;      /* the daemon-owned backing fd */
+    int fd;         /* the daemon-owned backing: ashmem, memfd or a file */
     char path[128]; /* file-tier backing path to unlink, else "" */
     u64 nattch;
     int rmid; /* IPC_RMID pending: free at the last detach */
@@ -434,7 +439,7 @@ struct seg {
 };
 
 static struct seg *g_seg; /* SHM_SEG_MAX entries, mmap'd by the daemon */
-static s32 g_next_shmid = 1;
+static u32 g_next_seq = 1; /* the low half of the next shmid (see shm_alloc_id) */
 
 static struct seg *shm_find(s32 shmid) {
     if (shmid <= 0)
@@ -446,8 +451,8 @@ static struct seg *shm_find(s32 shmid) {
 }
 
 static void shm_free(struct seg *s) {
-    if (s->memfd >= 0)
-        sys_close(s->memfd);
+    if (s->fd >= 0)
+        sys_close(s->fd);
     if (s->path[0])
         CNG_SYS(__NR_unlinkat, CNG_AT_FDCWD, s->path, 0, 0, 0, 0);
     if (s->att)
@@ -561,28 +566,164 @@ static void shm_reclaim_all(void) {
             shm_reclaim_seg(&g_seg[i]);
 }
 
+/* ---- daemon: the libandroid-shmem door ---------------------------------- */
+
+/* Termux has no SysV shm either, and its programs get theirs from
+ * libandroid-shmem, a copy of which every X server there carries: Termux's
+ * Xvfb and Xvnc link it, termux-x11 embeds it, and proot's --sysvipc allocates
+ * through it. Its shmid is an address rather than an index. The high 16 bits
+ * name the abstract AF_UNIX socket "/dev/shm/%08x" of the process that created
+ * the segment, and an shmat of an id the caller does not hold itself connects
+ * there, sends the id, reads back the key, receives the descriptor over
+ * SCM_RIGHTS and sizes it with ASHMEM_GET_SIZE. Our ids were 1, 2, 3..., whose
+ * high half is 0, the socket id of a process that never created a segment of
+ * its own. So the X server answered EINVAL without asking anyone, and every
+ * MIT-SHM client in the guest got BadAccess for its XShmAttach (measured:
+ * mpv --vo=x11 under termux-x11).
+ *
+ * So the daemon speaks that protocol too. The first segment it creates binds
+ * a socket id of its own, and every shmid it hands out carries it in the high
+ * half. A host process that asks there is answered with the segment's key and
+ * its backing, which is ashmem wherever /dev/ashmem opens (shm_make_backing),
+ * because the size probe is ashmem's ioctl.
+ *
+ * Who is answered: a peer with our uid, as on the rendezvous (peer_pid), which
+ * already hands such a peer every segment it asks for. The segment's mode is
+ * not consulted. A host process stands outside the guest's
+ * possibly faked identities, and the X server checks the client's credentials
+ * itself, as the kernel's model has it do; refusing 0600 here would refuse
+ * every segment GTK and cairo make.
+ *
+ * What it does not do: count the host's attachment in nattch. The protocol has
+ * no detach to drop it again, and an attach that is never dropped would pin
+ * the segment for the namespace's lifetime. The host keeps its own descriptor
+ * and mapping, which hold the memory past the guest's IPC_RMID and last
+ * detach, as a kernel attachment would. Nor the other direction: a guest shmat
+ * of an id a Termux process created is still EINVAL. */
+#define ASHV_SOCK_MAX 0x7fffu /* socket ids 1..this: every shmid stays positive */
+#define ASHV_SEQ_MAX  0xffffu /* the low half: 1..this */
+
+static int g_ashv_ls = -1; /* the "/dev/shm/%08x" listener, once bound */
+static u32 g_ashv_sock;    /* its socket id, 0 while none is bound */
+
+/* libandroid-shmem's spelling of the name, byte for byte: abstract names match
+ * on their length too, and its addrlen is the family, the leading NUL and the
+ * text, with no terminator. */
+static unsigned ashv_addr(struct cng_sockaddr_un *a, u32 sock) {
+    memset(a, 0, sizeof *a);
+    a->family = CNG_AF_UNIX;
+    size_t n = cng_snprintf(a->path + 1, sizeof a->path - 1, "/dev/shm/%08x",
+                            sock);
+    return (unsigned)(sizeof a->family + 1 + n);
+}
+
+/* Claim a socket id: the first free one from our pid on, the way
+ * libandroid-shmem starts from its own. Tried once per daemon; a host that
+ * will not let us bind any leaves the ids in the low half, as before. */
+static void ashv_bind(void) {
+    static int tried;
+    if (tried)
+        return;
+    tried = 1;
+    long ls = CNG_SYS(__NR_socket, CNG_AF_UNIX,
+                      CNG_SOCK_STREAM | CNG_SOCK_CLOEXEC, 0, 0, 0, 0);
+    if (ls < 0)
+        return;
+    u32 first = (u32)sys_getpid() % ASHV_SOCK_MAX;
+    for (u32 i = 0; i < ASHV_SOCK_MAX; i++) {
+        u32 sock = (first + i) % ASHV_SOCK_MAX + 1;
+        struct cng_sockaddr_un a;
+        unsigned al = ashv_addr(&a, sock);
+        long r = CNG_SYS(__NR_bind, ls, &a, al, 0, 0, 0);
+        if (r == 0) {
+            if (CNG_SYS(__NR_listen, ls, 16, 0, 0, 0, 0) != 0)
+                break;
+            g_ashv_ls = (int)ls;
+            g_ashv_sock = sock;
+            return;
+        }
+        if (r != -EADDRINUSE)
+            break;
+    }
+    sys_close((int)ls);
+}
+
+/* One host request: the shmid in, the key out, then a single byte carrying the
+ * descriptor. Separately, because the client reads the key with a plain
+ * read(2), which would discard a descriptor riding on it. An id that is not
+ * ours is answered by hanging up, which is what libandroid-shmem does too and
+ * what its client turns into EINVAL. */
+static void ashv_serve(void) {
+    long c = CNG_SYS(__NR_accept4, g_ashv_ls, 0, 0, CNG_SOCK_CLOEXEC, 0, 0);
+    if (c < 0)
+        return;
+    struct seg *s = 0;
+    if (peer_pid((int)c) >= 0) {
+        struct cng_timeval tv = {2, 0}; /* never wedge on a client */
+        CNG_SYS(__NR_setsockopt, c, CNG_SOL_SOCKET, CNG_SO_RCVTIMEO, &tv,
+                sizeof tv, 0);
+        s32 shmid;
+        if (cng_broker_read_full((int)c, &shmid, sizeof shmid) == 0)
+            s = shm_find(shmid);
+    }
+    if (s && cng_broker_write_full((int)c, &s->key, sizeof s->key) == 0)
+        cng_broker_send((int)c, "!", 1, s->fd);
+    sys_close((int)c);
+}
+
+/* The next free shmid: our socket id over a sequence number. The low half is
+ * all libandroid-shmem leaves for one, so ids come round again after 65535
+ * segments rather than 2^31; a live one is skipped, and SHM_SEG_MAX bounds how
+ * many can be. */
 static s32 shm_alloc_id(void) {
     for (int tries = 0; tries < SHM_SEG_MAX * 4; tries++) {
-        s32 id = g_next_shmid++;
-        if (g_next_shmid <= 0)
-            g_next_shmid = 1;
-        if (id > 0 && !shm_find(id))
+        u32 seq = g_next_seq++;
+        if (g_next_seq > ASHV_SEQ_MAX)
+            g_next_seq = 1;
+        s32 id = (s32)(g_ashv_sock << 16 | seq);
+        if (!shm_find(id))
             return id;
     }
     return -1;
 }
 
-/* Create a segment's backing: an anonymous memfd (the normal, Android-safe
- * path) or — where memfd_create is unavailable, or CNG_SHM_FORCE_FILE forces it
- * for a test — a file in the first writable dir. `path_out` gets the file path
- * (to unlink on free) or "". The file's name says nothing about the segment:
- * see the note below. Returns the fd, or -1 (no backing: the caller fails the
- * syscall rather than handing back memory nobody can share). */
+/* Back a segment with ashmem: the one backing a libandroid-shmem peer can use,
+ * since it learns the size from ASHMEM_GET_SIZE (see the door above). -1 where
+ * there is no /dev/ashmem, or the app may not open it. */
+static long shm_ashmem(u64 len) {
+    long fd = sys_openat(CNG_AT_FDCWD, "/dev/ashmem",
+                         CNG_O_RDWR | CNG_O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char name[CNG_ASHMEM_NAME_LEN]; /* the kernel may read all of it */
+    memset(name, 0, sizeof name);
+    cng_strlcpy(name, "cng-shm", sizeof name);
+    if (sys_ioctl((int)fd, CNG_ASHMEM_SET_NAME, name) != 0 ||
+        sys_ioctl((int)fd, CNG_ASHMEM_SET_SIZE, (void *)len) != 0) {
+        sys_close((int)fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Create a segment's backing: ashmem where the host has it, an anonymous memfd
+ * elsewhere (both Android-safe), or — where memfd_create is unavailable, or
+ * CNG_SHM_FORCE_FILE forces it for a test — a file in the first writable dir.
+ * `path_out` gets the file path (to unlink on free) or "". The file's name says
+ * nothing about the segment: see the note below. Returns the fd, or -1 (no
+ * backing: the caller fails the syscall rather than handing back memory nobody
+ * can share). */
 static int shm_make_backing(u64 size, char *path_out, size_t path_sz) {
     path_out[0] = '\0';
     long fd = -1;
-    if (!cng_broker_env("CNG_SHM_FORCE_FILE"))
+    if (!cng_broker_env("CNG_SHM_FORCE_FILE")) {
+        /* Sized here, page-rounded like the other tiers below: ashmem has no
+         * truncate, and an mmap may not exceed the size it was given. */
+        fd = shm_ashmem(cng_page_up(size));
+        if (fd >= 0)
+            return (int)fd;
         fd = sys_memfd_create("cng-shm", CNG_MFD_CLOEXEC);
+    }
     if (fd < 0) {
         const char *dir = cng_broker_shared_dir();
         if (!dir)
@@ -676,6 +817,7 @@ static s32 shm_do_get(const struct cng_breq *q) {
         }
     if (slot < 0)
         return -ENOSPC;
+    ashv_bind(); /* before the first id: it is the id's high half */
     s32 id = shm_alloc_id();
     if (id < 0)
         return -ENOSPC;
@@ -694,7 +836,7 @@ static s32 shm_do_get(const struct cng_breq *q) {
     s->gid = s->cgid = q->gid;
     s->cpid = q->pid;
     s->ctime = now;
-    s->memfd = fd;
+    s->fd = fd;
     cng_strlcpy(s->path, path, sizeof s->path);
     return id;
 }
@@ -709,7 +851,7 @@ static s32 shm_do_at(const struct cng_breq *q, struct cng_bresp *r, int *outfd) 
     if (!shm_permitted(s, q->uid, q->gid, !(q->arg & CNG_SHMAT_RDONLY),
                        q->arg & CNG_SHMAT_EXEC))
         return -EACCES;
-    *outfd = s->memfd; /* SCM_RIGHTS dups it into the caller */
+    *outfd = s->fd; /* SCM_RIGHTS dups it into the caller */
     s->nattch++;
     shm_att_add(s, q->pid);
     s->lpid = q->pid;
@@ -835,14 +977,15 @@ static s32 shm_do_ctl(const struct cng_breq *q, struct cng_bresp *r) {
     case CNG_SHM_LOCK:
     case CNG_SHM_UNLOCK:
         /* Owner-checked no-ops. The kernel pins the segment's pages against
-         * swap; there is nothing here to pin (the pages belong to a memfd the
-         * broker holds) and no way to ask the host to, since the guest cannot
-         * reach the segment through any host IPC object. Reporting the
-         * refusal the caller would get from an unprivileged kernel would be
-         * the worse answer: the owner is allowed to lock, and callers treat
-         * success as "it will stay resident", which under a memfd it does
-         * unless the host swaps — exactly the guarantee we could not have
-         * strengthened anyway. arm64chroot answers EINVAL here. */
+         * swap; there is nothing here to pin (the pages belong to an ashmem
+         * region or a memfd the broker holds) and no way to ask the host to,
+         * since the guest cannot reach the segment through any host IPC
+         * object. Reporting the refusal the caller would get from an
+         * unprivileged kernel would be the worse answer: the owner is allowed
+         * to lock, and callers treat success as "it will stay resident",
+         * which it does unless the host swaps — exactly the guarantee we
+         * could not have strengthened anyway. arm64chroot answers EINVAL
+         * here. */
         if (!shm_owner(s, q->uid))
             return -EPERM;
         return 0;
@@ -906,11 +1049,30 @@ static int tab_memfd(void **tab_out) {
 
 /* Serve one connected client: dispatch the request and reply. Returns 1 when the
  * connection has been parked in a waiter slot (a blocking semop/msgsnd/msgrcv),
- * in which case the caller must not close it. */
-static int ipc_serve(int cfd, const struct cng_breq *q, void **tab) {
+ * in which case the caller must not close it. `infd` is a descriptor that came
+ * with the request, or -1: only a netlink registration has a use for one, and
+ * every other request has it closed here. */
+static int ipc_serve(int cfd, const struct cng_breq *q, void **tab, int infd) {
     struct cng_bresp r;
     memset(&r, 0, sizeof r);
     int outfd = -1;
+    if (q->op == CNG_REQ_NLSOCK) {
+        /* The port id is the registering process's pid, as the kernel tells
+         * it (q->pid is the SO_PEERCRED answer by now): the guest side reports
+         * the same from its getpid() in getsockname. */
+        r.ret = infd < 0 ? -EBADF
+                         : (s32)cng_nl_serve_register(infd, (unsigned)q->pid,
+                                                      q->arg);
+        cng_broker_send(cfd, &r, sizeof r, -1);
+        return 0;
+    }
+    if (infd >= 0)
+        sys_close(infd);
+    if (q->op == CNG_REQ_NLSYNC) {
+        r.ret = (s32)cng_nl_serve_sync((unsigned)q->id, &r);
+        cng_broker_send(cfd, &r, sizeof r, -1);
+        return 0;
+    }
     if (q->op == CNG_REQ_TAB) {
         outfd = tab_memfd(tab);
         r.ret = outfd < 0 ? -ENOSYS : 0;
@@ -942,22 +1104,31 @@ static int ipc_serve(int cfd, const struct cng_breq *q, void **tab) {
     return 0;
 }
 
-/* How many fds the poll array holds: the listener plus one per parked waiter. */
-#define BROKER_POLL_MAX (1 + CNG_IPC_WAITER_MAX)
+/* How many fds the poll array holds: the two listeners (the rendezvous, and the
+ * libandroid-shmem door, -1 until a segment binds it), one per parked waiter,
+ * and the daemon's end of every emulated netlink socket. */
+#define BROKER_POLL_FIXED 2
+#define BROKER_POLL_IPC (BROKER_POLL_FIXED + CNG_IPC_WAITER_MAX)
+#define BROKER_POLL_MAX (BROKER_POLL_IPC + CNG_NL_SOCK_MAX)
 
 #define BROKER_GRACE_MS 10000 /* linger this long past the last user's exit */
 #define BROKER_TICK_MS  1000  /* reclaim cadence while waiters or undo exist */
 
 /* Daemon main loop; never returns. Owns the rendezvous socket, the table memfd
- * (once asked for), every segment backing and all semaphore / message-queue
- * state, and exits once nothing — a live guest, segment, set, queue, undo row or
- * parked waiter — has anchored the namespace for the grace window.
+ * (once asked for), every segment backing and the libandroid-shmem door host
+ * processes attach them through, all semaphore / message-queue state and its
+ * end of every emulated netlink socket, and exits once nothing — a live
+ * guest, segment, set, queue, undo row, parked waiter or netlink socket — has
+ * anchored the namespace for the grace window.
  *
- * The loop watches the listener and every parked waiter's connection at once,
- * which is what lets a blocking semop sleep without wedging the daemon for
- * everyone else. A timed wait's deadline bounds the poll directly, so it expires
- * on time rather than at tick granularity; the tick is only for the /proc reads
- * that notice a dead waiter or apply a dead process's SEM_UNDO. */
+ * The loop watches both listeners, every parked waiter's connection and every
+ * netlink end at once, which is what lets a blocking semop sleep without
+ * wedging the daemon for everyone else, and what answers a netlink request
+ * written with a plain write(2) — no call of the guest's that the monitor sees
+ * follows it before the read that waits for the reply. A timed wait's deadline
+ * bounds the poll directly, so it expires on time rather than at tick
+ * granularity; the tick is only for the /proc reads that notice a dead waiter
+ * or apply a dead process's SEM_UNDO. */
 static _Noreturn void broker_main(const struct broker_ns *ns) {
     long ls = CNG_SYS(__NR_socket, CNG_AF_UNIX,
                       CNG_SOCK_STREAM | CNG_SOCK_CLOEXEC, 0, 0, 0, 0);
@@ -990,10 +1161,15 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
         pf[0].fd = (int)ls;
         pf[0].events = CNG_POLLIN;
         pf[0].revents = 0;
+        pf[1].fd = g_ashv_ls; /* a negative fd is skipped by the poll */
+        pf[1].events = CNG_POLLIN;
+        pf[1].revents = 0;
         s64 next = last_active + BROKER_GRACE_MS - now; /* the idle-exit check */
         if (cng_ipc_pending() && next > BROKER_TICK_MS)
             next = BROKER_TICK_MS;
-        int nfds = cng_ipc_poll_add(pf, 1, BROKER_POLL_MAX, now, &next);
+        int nlfrom = cng_ipc_poll_add(pf, BROKER_POLL_FIXED, BROKER_POLL_IPC,
+                                      now, &next);
+        int nfds = cng_nl_poll_add(pf, nlfrom, BROKER_POLL_MAX);
         if (next < 0)
             next = 0;
         struct cng_timespec to = {next / 1000, (next % 1000) * 1000000};
@@ -1007,7 +1183,12 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
         if (r > 0) {
             last_active = now;
             /* Parked connections first: cancels, deaths, protocol garbage. */
-            cng_ipc_poll_ready(pf, 1, nfds);
+            cng_ipc_poll_ready(pf, BROKER_POLL_FIXED, nlfrom);
+            /* Requests on the netlink ends, and the ends whose guests left. */
+            cng_nl_poll_ready(pf, nlfrom, nfds);
+            /* A host process attaching one of our segments. */
+            if (pf[1].revents & CNG_POLLIN)
+                ashv_serve();
             if (pf[0].revents & CNG_POLLIN) {
                 long c = CNG_SYS(__NR_accept4, ls, 0, 0, CNG_SOCK_CLOEXEC, 0, 0);
                 int cpid = c >= 0 ? peer_pid((int)c) : -1;
@@ -1020,10 +1201,13 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
                     CNG_SYS(__NR_setsockopt, c, CNG_SOL_SOCKET, CNG_SO_RCVTIMEO,
                             &tv, sizeof tv, 0);
                     struct cng_breq q;
-                    int parked = 0;
-                    /* Ours by uid; now ours by namespace, or not answered. */
+                    int parked = 0, infd = -1;
+                    /* Ours by uid; now ours by namespace, or not answered. A
+                     * descriptor that came with the request is ipc_serve's to
+                     * keep or close (cng_broker_recv closes one that came
+                     * with less than a whole request). */
                     if (broker_hello_check((int)c, ns) == 0 &&
-                        cng_broker_recv((int)c, &q, sizeof q, 0) == 0) {
+                        cng_broker_recv((int)c, &q, sizeof q, &infd) == 0) {
                         /* The kernel's answer replaces the client's claim. Every
                          * legitimate client stamps exactly this (cng_broker_open
                          * calls getpid), and it is the field the registries key
@@ -1033,7 +1217,7 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
                          * could name another and detach its segments, inherit
                          * its undo, or have its own rows reclaimed under it. */
                         q.pid = (s32)cpid;
-                        parked = ipc_serve((int)c, &q, &tab);
+                        parked = ipc_serve((int)c, &q, &tab, infd);
                     }
                     if (!parked)
                         sys_close((int)c);
@@ -1051,7 +1235,7 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
             shm_reclaim_all();
             cng_ipc_reclaim();
             if (!(tab && cng_procreg_table_live(tab)) && !shm_any_live() &&
-                !cng_ipc_any_live()) {
+                !cng_ipc_any_live() && !cng_nl_any_live()) {
                 /* Those two scans read /proc once per tracked attacher, waiter
                  * and undo row, and the teardown below closes and unlinks a
                  * file per segment. A client that connected across any of it
@@ -1081,6 +1265,7 @@ static _Noreturn void broker_main(const struct broker_ns *ns) {
     }
     shm_free_all();
     cng_ipc_free_all();
+    cng_nl_free_all();
     sys_exit_group(0);
 }
 
@@ -1259,6 +1444,11 @@ int cng_broker_open(struct cng_breq *q) {
 }
 
 int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out) {
+    return cng_broker_rpc_fd(q, -1, r, fd_out);
+}
+
+int cng_broker_rpc_fd(struct cng_breq *q, int fd_in, struct cng_bresp *r,
+                      int *fd_out) {
     /* Twice, because a successful connect is not proof of a daemon that will
      * answer. The listener stays bound while the daemon decides to leave, so a
      * connect landing in that window is queued on the backlog and succeeds, the
@@ -1272,12 +1462,14 @@ int cng_broker_rpc(struct cng_breq *q, struct cng_bresp *r, int *fd_out) {
      * same thing seen from the other end: a request the daemon never received
      * whole is a request cng_broker_recv refuses to serve. One retry is enough
      * because the daemon now closes its listener before tearing anything down,
-     * so the connect that follows is refused and spawns a fresh one. */
+     * so the connect that follows is refused and spawns a fresh one. A
+     * descriptor riding with the request goes again with the retry: whatever
+     * copy the departed daemon took was gone with it. */
     for (int attempt = 0; attempt < 2; attempt++) {
         int s = cng_broker_open(q);
         if (s < 0)
             return -1;
-        int rc = cng_broker_send(s, q, sizeof *q, -1) == 0
+        int rc = cng_broker_send(s, q, sizeof *q, fd_in) == 0
                      ? cng_broker_recv(s, r, sizeof *r, fd_out)
                      : CNG_BROKER_GONE;
         sys_close(s); /* transient: keep no persistent broker fd */

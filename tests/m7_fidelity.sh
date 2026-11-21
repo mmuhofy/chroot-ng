@@ -17,8 +17,15 @@ check_contains "stat and fstat agree about ownership under --fake-id" \
     "stat_vs_fstat stat=0:0 fstat=0:0 -> OK" "$out"
 check_contains "fake-root reopens a file it may execute but not read" \
     "fakeroot_reopen: opened=1 mode_kept=1 -> OK" "$out"
-check_contains "a refused reopen is served from the fd we hold, rewound" \
-    "fd_reopen: dup=1 content=1 -> OK" "$out"
+# A reopen the host refused is served from the fd we hold only as the
+# description the open asked for. A read-only reopen of an O_RDWR memfd is how
+# Chrome makes the read-only half of a shared-memory region, and an O_RDWR
+# duplicate failed its F_GETFL CHECK: the refusal stands, except for the script
+# a #! exec ran from that fd — and not once its number names another file.
+check_contains "a refused reopen is served from the fd we hold, in its mode" \
+    "fd_reopen: narrower=-13 script=1 content=1 exact=1 reused=-13 -> OK" "$out"
+check_contains "fake-root passes fchmodat2's ENOSYS on for the fallback" \
+    "fchmodat2_enosys=-38 want=-38 -> OK" "$out"
 check_contains "supplementary groups empty" "ngroups=0"           "$out"
 # The set has to hold a realistic list. initgroups(3) against a directory
 # service hands over more than a handful, and a ceiling it trips is an EINVAL
@@ -97,8 +104,15 @@ check_contains "l2s decref reclaims the backing on last unlink" \
     "l2s-decref: nlink_after1=1 gone=1 -> OK" "$out"
 check_contains "l2s backing pair lives in the central store, names stay clean" \
     "l2s-store: store=1 user_clean=1 -> OK" "$out"
-check_contains "l2s fstat/AT_EMPTY_PATH/statx-mask report emulated nlink" \
-    "l2s-fstat: fd=1 empty=1 emptyx=1 mask=1 -> OK" "$out"
+case "$out" in
+*"l2s-fstat: fd=1 empty=1 emptyx=-1 mask=-1 -> OK"*)
+    skip "l2s statx legs: this host has no statx to issue (kernel or ambient filter)"
+    check_contains "l2s fstat/AT_EMPTY_PATH report emulated nlink" \
+        "l2s-fstat: fd=1 empty=1 emptyx=-1 mask=-1 -> OK" "$out" ;;
+*)
+    check_contains "l2s fstat/AT_EMPTY_PATH/statx-mask report emulated nlink" \
+        "l2s-fstat: fd=1 empty=1 emptyx=1 mask=1 -> OK" "$out" ;;
+esac
 check_contains "l2s readlink via dirfd refuses with EINVAL" \
     "l2s-dirfd-readlink: einval=1 -> OK" "$out"
 check_contains "l2s cross-directory link shares inode/count via the store" \
@@ -187,6 +201,29 @@ check_contains "l2s reads a group's count from its own marker only" \
 # file's own inode (M10's race leg drives the exchange against real readers).
 check_contains "l2s first link moves the file by exchange, or in two steps" \
     "l2s-swap: exchange=1 two_steps=1 -> OK" "$out"
+# A link of a symlink (not followed) is the symlink's: the fallback opened the
+# source to copy it and the pin refused that with ELOOP. The new name is a
+# second symlink with the same text and times; a text in the ".l2s." grammar
+# is not copied.
+check_contains "l2s link of a symlink makes a symlink with its text" \
+    "l2s-symlink: rc=0 lnk=1 text=1 times=1 guard=1 -> OK" "$out"
+# Two names of one group are two names of one file: a rename between them does
+# nothing and answers 0 (the host moved one symlink over the other, so the
+# source was gone and the count a link short), and under RENAME_EXCHANGE a
+# legacy bare-target link that lands in another directory is repointed.
+check_contains "l2s rename between two names of one file does nothing" \
+    "l2s-samefile: mv=0 exch=0 noreplace=1 kept=1 legacy_exch=1 -> OK" "$out"
+# A FIFO or a socket is a group's data as a regular file is: both names are one
+# pipe, one socket. The copy path opened the FIFO and hung until a writer came.
+check_contains "l2s links of a FIFO and a socket share the node" \
+    "l2s-node: fifo=1 pipe=1 socket=1 -> OK" "$out"
+# A proot-distro rootfs holds the groups proot made (members naming an
+# indirection by host path, the count in the data file's name). They are read
+# as hardlinks and kept with proot's bookkeeping; a moved tree's texts heal, a
+# cut chain is mended by the next change, chains that leave the view are not
+# groups. M10 diffs the same against real hardlinks.
+check_contains "l2s reads and keeps the groups proot made" \
+    "l2s-proot: read=1 link=0 ind3=1 member=1 three=1 follow=1 two=1 gone=1 moved=1 beside=1 cut=1 hostile=1 -> OK" "$out"
 check_contains "fchdir updates virtual cwd" "fchdir: cwd=/w -> OK" "$out"
 check_contains "chdir through a symlink records the directory it landed in" \
     "chdir-symlink: rc=0 cwd=/w -> OK" "$out"
@@ -258,6 +295,270 @@ elif guest_cc_report "$PCD/peercred" tests/guests/peercred.c; then
         "$out"
 fi
 rm -rf "$PCD"
+
+# --- SCM_CREDENTIALS under the fake identity ----------------------------------
+# A credentials record is a claim the kernel holds its sender to
+# (scm_check_creds): the uid must be the real, effective or saved one unless
+# CAP_SETUID lets any through, the gid likewise. GLib claims its own pid and
+# effective ids before every D-Bus authentication, and under --fake-id those
+# are the fake ones, which the kernel refused with EPERM — a fake root's GDBus
+# client reached no bus ("Error sending credentials", XFCE's "Unable to
+# contact settings server"). The claim is judged against the fake set now and
+# spelled in the host's ids, and a received record is remapped as SO_PEERCRED
+# is, cut short or not. A refused claim is the kernel's EPERM only where the
+# suite does not run as root (a privileged kernel lets any claim through), so
+# those rows are judged there alone; qemu-user drops MSG_CTRUNC from a cut
+# record, so that flag is asserted natively only.
+SCD=$(mktemp -d)
+scm_rows() { # tier-desc, -R or "", id spec or "", self uid, self gid
+    _d=$1 _t=$2 _u=$3 _su=$4 _sg=$5
+    # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+    out=$(run_t 60 $_t $GUEST_BINDS $_u "$SCD/rootfs" /bin/scmcred 2>/dev/null)
+    _me="uid=$_su gid=$_sg self=$_su:$_sg"
+    check_contains "$_d: an own claim goes out and comes back as the identity" \
+        "own pid_ok=1 $_me" "$out"
+    check_contains "$_d: ...so does the real uid's" "real pid_ok=1 $_me" "$out"
+    check_contains "$_d: SO_PASSCRED's own record is the identity too" \
+        "implicit pid_ok=1 $_me" "$out"
+    check_contains "$_d: ...beside a descriptor, which still arrives" \
+        "rights pid_ok=1 uid=$_su gid=$_sg fifo=1 self=$_su:$_sg" "$out"
+    check_contains "$_d: sendmmsg's claims go out and recvmmsg remaps them" \
+        "mmsg got=2 uid=$_su gid=$_sg uid=$_su gid=$_sg self=$_su:$_sg" "$out"
+    check_contains "$_d: a receive cut inside the record remaps the uid it has" \
+        "short pid_ok=1 uid=$_su" "$out"
+    [ -n "$QEMU" ] || check_contains "$_d: ...and reports the cut" \
+        "short pid_ok=1 uid=$_su ctrunc self=$_su:$_sg" "$out"
+    check_contains "$_d: an id of -1 is the kernel's EINVAL" "uid-1 send=22" "$out"
+    check_contains "$_d: ...and so is a record of the wrong length" \
+        "badlen send=22" "$out"
+    [ "$(id -u)" = 0 ] && return 0
+    check_contains "$_d: a pid not the sender's is refused" \
+        "other-pid send=1" "$out"
+}
+if ! guest_xlate_ready "SCM_CREDENTIALS legs"; then
+    :
+elif guest_cc_report "$SCD/scmcred" tests/guests/scmcred.c; then
+    mkdir -p "$SCD/rootfs/bin"; cp "$SCD/scmcred" "$SCD/rootfs/bin/"
+    tiers=-R
+    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    for tier in $tiers; do
+        t=$tier; [ "$t" = none ] && t=
+        scm_rows "fake root ($tier)" "$t" "-u 0:0" 0 0
+        # Root's CAP_SETUID and CAP_SETGID let any id be claimed. The host's
+        # ids cannot say which, so the sender records its claim where the
+        # receiver looks it up, and the receiver is told the claim, as the
+        # kernel tells it.
+        check_contains "fake root ($tier): any uid may be claimed" \
+            "other-uid pid_ok=1 uid=1 gid=0 self=0:0" "$out"
+        check_contains "fake root ($tier): ...and any gid" \
+            "other-gid pid_ok=1 uid=0 gid=1 self=0:0" "$out"
+        check_contains "fake root ($tier): a dropped root may claim its saved ids" \
+            "saved pid_ok=1 uid=0 gid=0 self=1234:1234" "$out"
+        if [ "$(id -u)" != 0 ]; then
+            check_contains "fake root ($tier): ...but not an id it never had" \
+                "dropped-other send=1" "$out"
+        fi
+        # Dropping the saved ids as well drops the claim made under them, so
+        # SO_PASSCRED's record names the real ids it attaches, and an own
+        # claim names the new ones.
+        check_contains "fake root ($tier): a full drop's implicit record is its real ids" \
+            "dropped-implicit pid_ok=1 uid=1234 gid=1234 self=1234:1234" "$out"
+        check_contains "fake root ($tier): ...and its own claim the new ids" \
+            "dropped-own pid_ok=1 uid=1234 gid=1234 self=1234:1234" "$out"
+        scm_rows "fake 1234 ($tier)" "$t" "-u 1234:1234" 1234 1234
+        if [ "$(id -u)" != 0 ]; then
+            check_contains "fake 1234 ($tier): an id not its own is refused" \
+                "other-uid send=1" "$out"
+            check_contains "fake 1234 ($tier): ...a gid as much as a uid" \
+                "other-gid send=1" "$out"
+        fi
+    done
+    # Without a fake identity nothing is judged here and the kernel's own
+    # answer is what comes back.
+    scm_rows "real ids" -R "" "$(id -u)" "$(id -g)"
+fi
+rm -rf "$SCD"
+
+# --- a socket peer that has changed its ids -----------------------------------
+# Under -u every guest process has the host's ids, which are what the kernel
+# names a peer by, so a peer was always the identity the run began as. After
+# `su - user`, the session bus dbus-launch started ran as the user and was told
+# each client was root: it closed every connection, and XFCE said "Unable to
+# contact settings server: The connection is closed". A process publishes its
+# fake ids now, and SO_PEERCRED and a received credentials record name a guest
+# peer by them. tests/guests/peerid.c: a server takes one identity and listens,
+# a client takes another and connects, and each says what it was told of the
+# other (the client by SO_PEERCRED, an own claim and SO_PASSCRED's record).
+# The groups are published with the ids: SO_PEERGROUPS used to name the
+# host's, and another process's status file and /proc directory — which `ps`
+# names a process's user by — the identity the run began as. Every row is
+# what the kernel answers real root the same program (measured on the VM).
+PRD=$(mktemp -d)
+if ! guest_xlate_ready "socket peer id legs"; then
+    :
+elif guest_cc_report "$PRD/peerid" tests/guests/peerid.c; then
+    mkdir -p "$PRD/rootfs/bin" "$PRD/rootfs/tmp"
+    cp "$PRD/peerid" "$PRD/rootfs/bin/"
+    tiers=-R
+    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    for tier in $tiers; do
+        t=$tier; [ "$t" = none ] && t=
+        for pair in 1234:1234 0:1234 1234:0; do
+            _s=${pair%:*} _c=${pair#*:}
+            # shellcheck disable=SC2086  # $t and $GUEST_BINDS split on purpose
+            out=$(run_t 60 $t $GUEST_BINDS -u 0:0 "$PRD/rootfs" /bin/peerid \
+                "$_s" "$_c" 2>/dev/null)
+            _d="server $_s, client $_c ($tier)"
+            check_contains "$_d: the server is told the client's ids" \
+                "server peer pid_ok=1 uid=$_c gid=$_c self=$_s:$_s" "$out"
+            check_contains "$_d: ...the client the server's" \
+                "client peer pid_ok=1 uid=$_s gid=$_s self=$_c:$_c" "$out"
+            check_contains "$_d: ...a received claim names the client's" \
+                "claim pid_ok=1 uid=$_c gid=$_c" "$out"
+            check_contains "$_d: ...and so does SO_PASSCRED's own record" \
+                "implicit pid_ok=1 uid=$_c gid=$_c" "$out"
+            _sg="$((_s + 1)),$((_s + 2))" _cg="$((_c + 1)),$((_c + 2))"
+            case $out in
+            *"groups errno=92"*)
+                skip "$_d: SO_PEERGROUPS (the kernel predates it)" ;;
+            *)
+                check_contains "$_d: SO_PEERGROUPS names the client's groups" \
+                    "server groups=$_cg" "$out"
+                check_contains "$_d: ...and the server's" \
+                    "client groups=$_sg" "$out"
+                check_contains "$_d: ...too short a buffer is ERANGE and the length" \
+                    "server groups-short r=-1 errno=34 len=8" "$out"
+                ;;
+            esac
+            check_contains "$_d: the client's status has its ids and groups" \
+                "server status Uid:$_c,$_c,$_c,$_c Gid:$_c,$_c,$_c,$_c Groups:$_cg" \
+                "$out"
+            check_contains "$_d: ...and the server's its own" \
+                "client status Uid:$_s,$_s,$_s,$_s Gid:$_s,$_s,$_s,$_s Groups:$_sg" \
+                "$out"
+            check_contains "$_d: ...and so does its thread's (ps -L)" \
+                "server task-status Uid:$_c,$_c,$_c,$_c Gid:$_c,$_c,$_c,$_c Groups:$_cg" \
+                "$out"
+            check_contains "$_d: the client's /proc directory is its ids' (ps)" \
+                "server procdir $_c:$_c fd=$_c:$_c task=$_c:$_c" "$out"
+            check_contains "$_d: ...and the server's" \
+                "client procdir $_s:$_s fd=$_s:$_s task=$_s:$_s" "$out"
+            case $out in
+            *"procdir-statx errno=38"*) skip "$_d: statx (no such call)" ;;
+            *)
+                check_contains "$_d: ...by statx as well" \
+                    "server procdir-statx $_c:$_c" "$out"
+                ;;
+            esac
+            check_contains "$_d: /proc/self is the client's own" \
+                "client self $_c:$_c" "$out"
+        done
+    done
+fi
+rm -rf "$PRD"
+
+# --- capset, judged against the set ------------------------------------------
+# A fake root's capability set is all of them and anyone else's none, and a
+# capset used to be accepted whole for the one and refused whole for the
+# other. But the kernel lets any process drop what it has, nothing included:
+# Chrome's zygote drops every capability in each child it forks and CHECKs the
+# answer, and as any user but root its first child died ("credentials.cc:
+# Check failed: . : Operation not permitted"). tests/guests/capset.c runs each
+# row in a child of its own, so one that succeeds does not change what the
+# next is judged against. Every row is what the kernel answers real root, and
+# root dropped to 1234, the same program (measured on the VM).
+CPD=$(mktemp -d)
+cap_rows() { # description, tier, guest args...
+    _cd=$1 _ct=$2
+    shift 2
+    # shellcheck disable=SC2086  # $_ct and $GUEST_BINDS split on purpose
+    out=$(run_t 60 $_ct $GUEST_BINDS -u 0:0 "$CPD/rootfs" /bin/capset "$@" \
+        2>/dev/null)
+    check_contains "$_cd: a set that asks for nothing is a drop, and allowed" \
+        "none=0 errno=0" "$out"
+    check_contains "$_cd: ...in the one-word header version too" \
+        "none_v1=0 errno=0" "$out"
+    check_contains "$_cd: an effective bit not also permitted is refused" \
+        "eff_unpermitted=-1 errno=1" "$out"
+    check_contains "$_cd: a capability no kernel has is cleared, not judged" \
+        "beyond=0 errno=0" "$out"
+    check_contains "$_cd: a thread names itself by its own id" \
+        "thread_tid=0 errno=0" "$out"
+    check_contains "$_cd: ...and not by its process's" \
+        "thread_pid=-1 errno=1" "$out"
+    check_contains "$_cd: another process is refused" \
+        "other_pid=-1 errno=1" "$out"
+    check_contains "$_cd: a bad data pointer is EFAULT" \
+        "bad_data=-1 errno=14" "$out"
+}
+if ! guest_xlate_ready "capset legs"; then
+    :
+elif guest_cc_report "$CPD/capset" tests/guests/capset.c -pthread; then
+    mkdir -p "$CPD/rootfs/bin"
+    cp "$CPD/capset" "$CPD/rootfs/bin/"
+    tiers=-R
+    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    for tier in $tiers; do
+        t=$tier; [ "$t" = none ] && t=
+        cap_rows "capset as fake root ($tier)" "$t"
+        check_contains "capset as fake root ($tier): capget reports all of them" \
+            "full=1 errno=0" "$out"
+        check_contains "capset as fake root ($tier): ...and any may be kept" \
+            "permit=0 errno=0" "$out"
+        check_contains "capset as fake root ($tier): ...or made inheritable" \
+            "inherit=0 errno=0" "$out"
+        cap_rows "capset dropped to 1234 ($tier)" "$t" 1234
+        check_contains "capset dropped to 1234 ($tier): capget reports none" \
+            "full=0 errno=0" "$out"
+        check_contains "capset dropped to 1234 ($tier): ...none may be permitted" \
+            "permit=-1 errno=1" "$out"
+        check_contains "capset dropped to 1234 ($tier): ...or made inheritable" \
+            "inherit=-1 errno=1" "$out"
+    done
+fi
+rm -rf "$CPD"
+
+# A memfd reopened through its own /proc link. memfd_create only makes O_RDWR
+# files, and that open is the one way to a read-only description of one —
+# Chrome's read-only half of every shared-memory region, which it CHECKs with
+# F_GETFL — and how an interpreter reads a script run from a memfd (apk 3).
+# Android's policy refuses an app the open, and the O_RDWR duplicate chroot-ng
+# answered with killed Chrome. Where the host opens it, the description is
+# read-only; where it refuses, the refusal stands — never a writable one. The
+# exception is the script a #! exec ran from the fd, by either spelling, which
+# its interpreter reads whatever the host says; a close-on-exec one is gone by
+# then, as it is on a kernel.
+MRD=$(mktemp -d)
+if ! guest_xlate_ready "memfd reopen legs"; then
+    :
+elif guest_cc_report "$MRD/memfdro" tests/guests/memfdro.c; then
+    mkdir -p "$MRD/rootfs/bin"; cp "$MRD/memfdro" "$MRD/rootfs/bin/"
+    tiers=-R
+    [ "$CNG_SECCOMP_LIVE" = 1 ] && tiers="-R none"
+    for tier in $tiers; do
+        t=$tier; [ "$t" = none ] && t=
+        # shellcheck disable=SC2086  # $GUEST_BINDS is a deliberately split arg list
+        out=$(run_t 60 $t $GUEST_BINDS "$MRD/rootfs" /bin/memfdro 2>/dev/null)
+        case "$out" in
+        *"ro open=0 "*)
+            check_contains "memfd ($tier): a read-only reopen is read-only" \
+                "ro open=0 accmode=0 write=9" "$out" ;;
+        *)
+            check_contains "memfd ($tier): ...or the host's refusal, never a writable one" \
+                "ro open=13" "$out" ;;
+        esac
+        check_contains "memfd ($tier): a reopen in its own mode reads from the start" \
+            "rw open=0 accmode=2 read=data" "$out"
+        check_contains "memfd ($tier): a script run from one is read by its interpreter" \
+            "script interp open=0 head=1" "$out"
+        check_contains "memfd ($tier): ...and the exec says so" "script status=0" "$out"
+        check_contains "memfd ($tier): ...run through execveat's AT_EMPTY_PATH too" \
+            "script-at interp open=0 head=1" "$out"
+        check_contains "memfd ($tier): a close-on-exec one is gone for the interpreter" \
+            "cloexec interp open=2 head=0" "$out"
+    done
+fi
+rm -rf "$MRD"
 
 # --- the initial program's own /proc/self/exe ------------------------------
 # Every program after the first gets its exe link from the emulated execve; the

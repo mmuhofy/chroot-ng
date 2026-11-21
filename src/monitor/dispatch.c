@@ -70,16 +70,28 @@ static void statx_remap(void *st) {
 
 /* Fake-root turns a privilege-denied ownership/mode change into success — the
  * real process is unprivileged, but the guest believes it is root. Denied
- * (EPERM/EACCES/EINVAL) and Android-blocked (ENOSYS) results are faked; genuine
- * errors (ENOENT, EROFS, ...) still propagate, as do all results when the
- * identity is unprivileged or inactive. */
+ * (EPERM/EINVAL) and Android-blocked (ENOSYS) results are faked; genuine errors
+ * (ENOENT, EROFS, ...) still propagate, as do all results when the identity is
+ * unprivileged or inactive. EACCES is left to dac_bypass: on a path it is a
+ * search refused on the way to the name, which is lent first so that the
+ * change is made for real, and it is faked there (dac_faked) only where nothing
+ * could be lent. fchmodat2 goes through fchmodat2_result instead, whose ENOSYS
+ * asks for a fallback. */
 static long chattr_result(long r) {
     if (r == 0)
         return 0;
-    if (cng_fake_root() &&
-        (r == -EPERM || r == -EACCES || r == -EINVAL || r == -ENOSYS))
+    if (cng_fake_root() && (r == -EPERM || r == -EINVAL || r == -ENOSYS))
         return 0;
     return r;
+}
+
+/* fchmodat2's ENOSYS is not a refusal to fake: it is a kernel predating the
+ * call (Linux < 6.6), or Android's filter, answered as such a kernel would.
+ * glibc and systemd fall back to fchmodat (or a chmod of /proc/self/fd/N) on
+ * exactly that answer. Faked to success, the guest believes the mode changed
+ * and it silently stays as it was. */
+static long fchmodat2_result(long r) {
+    return r == -ENOSYS ? r : chattr_result(r);
 }
 
 static int fs_has_ro(void);
@@ -187,13 +199,20 @@ static long ro_refusal(const char *host, int atflags) {
 
 /* One-shot-per-number diagnostic that a syscall was emulated away (blocked by
  * Android's seccomp filter, or a credential change we can't perform). Shared
- * with the SIGSYS gate-net. Async-signal-safe. */
+ * with the SIGSYS gate-net. Async-signal-safe.
+ *
+ * CNG_DEBUG only: it is a note, not an error — the guest gets the emulated
+ * answer either way — and it goes to the guest's own stderr, which is the
+ * program's output as far as a pipe, a terminal or a package manager's log
+ * can tell. On Android, whose filter refuses numbers a libc reaches for
+ * routinely (openat2, the uid and gid setters, close_range on the older
+ * releases), an ordinary run printed one in the middle of its output. */
 void cng_note_blocked(int nr) {
     static unsigned char warned[600];
-    if (nr < 0 || nr >= (int)sizeof warned || warned[nr])
+    if (!cng_g_debug || nr < 0 || nr >= (int)sizeof warned || warned[nr])
         return;
     warned[nr] = 1;
-    cng_dprintf(2, "chroot-ng: syscall %d not permitted here -> emulated\n", nr);
+    cng_dprintf(2, "[cng] syscall %d not permitted here -> emulated\n", nr);
 }
 
 /* Re-issue the guest's (translated) syscall through the gate — but if Android's
@@ -248,6 +267,79 @@ static int g_no_faccessat2, g_no_fchmodat2, g_no_openat2;
      CNG_O_NOATIME | CNG_O_CLOEXEC | 04000000 /*__O_SYNC*/ | CNG_O_PATH |     \
      CNG___O_TMPFILE)
 #define OPEN_FLAGS_PATH (CNG_O_DIRECTORY | CNG_O_NOFOLLOW | CNG_O_PATH | CNG_O_CLOEXEC)
+
+/* Can openat2 be issued here at all? Not where the ambient filter refuses it
+ * (cng_blocked: Android's does), nor on a kernel older than 5.6 or
+ * under qemu-user, which answer ENOSYS. That last one is asked once, with a how
+ * every kernel that has the call accepts and a name that resolves to nothing,
+ * and remembered either way — as is the ENOSYS a pinned re-issue runs into.
+ *
+ * Where it cannot, a guest's own openat2 is emulated (see the openat2 case)
+ * rather than answered with that ENOSYS. glibc 2.43 put an openat2 wrapper in
+ * front of the raw call, and gnulib's own replacement — which falls back on
+ * ENOSYS — is no longer built where libc has one: Ubuntu 26.04's tar opens
+ * every directory it extracts into with RESOLVE_BENEATH that way, and each one
+ * came back "Cannot mkdir: Function not implemented". */
+static int g_have_openat2;
+
+static int openat2_absent(void) {
+    if (g_no_openat2 || cng_blocked[__NR_openat2])
+        return 1;
+    if (!g_have_openat2) {
+        struct cng_open_how h = {CNG_O_RDONLY, 0, 0};
+        long r = cng_syscall6(CNG_AT_FDCWD, (long)"", (long)&h, (long)sizeof h,
+                              0, 0, __NR_openat2);
+        if (r >= 0)
+            sys_close((int)r); /* an empty name cannot open, but never leak one */
+        if (r == -ENOSYS)
+            g_no_openat2 = 1;
+        else
+            g_have_openat2 = 1;
+    }
+    return g_no_openat2;
+}
+
+/* build_open_flags() as openat2 runs it, for where there is no kernel to ask
+ * (how_precheck asks it everywhere else). openat2 checks every argument that
+ * openat silently strips or ignores — a flag outside the set, an unknown
+ * resolve bit, a mode where nothing is created, O_PATH with anything but its
+ * companions — and refuses BENEATH with IN_ROOT; O_TMPFILE's own rules come
+ * from the same function and are shared with openat, in the kernel's order.
+ * Last, RESOLVE_CACHED: a create, a truncate or an O_TMPFILE is never even
+ * tried from the cache. Any other cached lookup is let through and made the
+ * ordinary way, which is what a warm cache answers. Returns 0 or the errno. */
+static long how_validate(const struct cng_open_how *how) {
+    unsigned long f = how->flags & ~(unsigned long)CNG_O_CLOEXEC;
+    if (f & ~(unsigned long)OPEN_FLAGS_KNOWN)
+        return -EINVAL;
+    if (how->resolve &
+        ~(unsigned long)(CNG_RESOLVE_NO_XDEV | CNG_RESOLVE_NO_MAGICLINKS |
+                         CNG_RESOLVE_NO_SYMLINKS | CNG_RESOLVE_BENEATH |
+                         CNG_RESOLVE_IN_ROOT | CNG_RESOLVE_CACHED))
+        return -EINVAL;
+    if ((how->resolve & CNG_RESOLVE_BENEATH) &&
+        (how->resolve & CNG_RESOLVE_IN_ROOT))
+        return -EINVAL;
+    if (f & (CNG_O_CREAT | CNG___O_TMPFILE)) {
+        if (how->mode & ~07777ul)
+            return -EINVAL;
+    } else if (how->mode) {
+        return -EINVAL;
+    }
+    /* O_TMPFILE carries O_DIRECTORY and takes write access; O_CREAT with it
+     * is refused, by the O_TMPFILE mask before 6.4 and by the O_DIRECTORY |
+     * O_CREAT rule after. */
+    if ((f & CNG___O_TMPFILE) &&
+        ((f & (CNG_O_TMPFILE | CNG_O_CREAT)) != CNG_O_TMPFILE ||
+         (f & CNG_O_ACCMODE) == CNG_O_RDONLY))
+        return -EINVAL;
+    if ((f & CNG_O_PATH) && (f & ~(unsigned long)OPEN_FLAGS_PATH))
+        return -EINVAL;
+    if ((how->resolve & CNG_RESOLVE_CACHED) &&
+        (f & (CNG_O_TRUNC | CNG_O_CREAT | CNG___O_TMPFILE)))
+        return -EAGAIN;
+    return 0;
+}
 
 static int open_as_openat2(long flags, long mode, struct cng_open_how *how) {
     if (g_no_openat2 || cng_blocked[__NR_openat2] ||
@@ -578,6 +670,27 @@ static long pin_args(long *nr, long *a, struct cng_pin *x, struct cng_pin *y,
     return 0;
 }
 
+/* How many dispatches of this process run from guest context for the SIGSYS
+ * handler right now (cng_dispatch_bounced). While there is none, which is
+ * nearly always, the re-issue below costs nothing extra. */
+static int g_disp_bounced;
+
+/* The re-issue's svc. Made for a bounced dispatch, which blocks there, it is
+ * made on the guest's own stack (the gframe's gsp): a guest handler delivered
+ * while it waits then lands on the stack the thread was on when it made the
+ * call, as for any call of its own, and not on our scratch stack — where a
+ * collector that scans the interrupted thread's stack from the handler's sp
+ * (a conservative GC's suspend signal) would be scanning ours. */
+static long reissue_svc(const long *a, long nr) {
+    if (__atomic_load_n(&g_disp_bounced, __ATOMIC_RELAXED)) {
+        struct cng_gframe *gf = cng_gframe_cur();
+        if (gf && gf->gsp)
+            return cng_syscall6_on(a[0], a[1], a[2], a[3], a[4], a[5], nr,
+                                   gf->gsp);
+    }
+    return cng_syscall6(a[0], a[1], a[2], a[3], a[4], a[5], nr);
+}
+
 static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
                     long nr) {
     char pb[CNG_PATH_MAX];
@@ -606,7 +719,7 @@ static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
     struct cng_open_how how;
     long r = pin_args(&callnr, a, &x, &y, spell, &how);
     if (r == 0) {
-        r = cng_syscall6(a[0], a[1], a[2], a[3], a[4], a[5], callnr);
+        r = reissue_svc(a, callnr);
         /* A kernel without the newer form: remembered, and the other form
          * taken this time and every time after. */
         if (r == -ENOSYS && callnr != nr &&
@@ -629,6 +742,113 @@ static long reissue(long a0, long a1, long a2, long a3, long a4, long a5,
         cng_dprintf(2, "[cng] nr=%ld %s -> errno=%ld\n", nr,
                     dbg_path(a0, a1, pb, sizeof pb), -r);
     return r;
+}
+
+/* --- calls that can block, from the SIGSYS handler -------------------------
+ *
+ * The handler runs with every signal masked, so a call it makes that blocks
+ * can be interrupted by nothing but SIGKILL: not the guest's own SIGTERM or
+ * ^C, not a ptrace attach, whose kick is masked with the rest. A CNG_DISP_HANDLER
+ * dispatch therefore does not make such a call. It answers CNG_EBOUNCE_RAW for
+ * one it would make exactly as the guest did, and CNG_EBOUNCE_DISP for one with
+ * something to translate, and the handler runs the call, or the whole
+ * dispatch, from guest context instead (sigsys.c, the bounce). Each test costs
+ * at most one syscall, made only for a call that is trapped already. */
+
+/* A socket call on `fd`, with MSG_* `msgflags` (0 for accept and connect):
+ * the bounce it takes from the handler when the descriptor blocks, RAW where
+ * `raw` says the dispatcher makes it as it stands. 0: make it here. */
+static long sock_bounce(int trapped, long nr, long fd, long msgflags, int raw) {
+    if (trapped != CNG_DISP_HANDLER || (msgflags & CNG_MSG_DONTWAIT))
+        return 0;
+    long fl = sys_fcntl((int)fd, CNG_F_GETFL, 0);
+    if (fl < 0 || (fl & CNG_O_NONBLOCK))
+        return 0;
+    /* accept(2) is made as accept4 where only that one is allowed (reissue),
+     * which is not the guest's call as it stands. */
+    if (raw && nr == __NR_accept && cng_blocked[__NR_accept])
+        raw = 0;
+    return raw ? -CNG_EBOUNCE_RAW : -CNG_EBOUNCE_DISP;
+}
+
+/* Is the address at `sa` (`len` bytes, as a guest passed it) an AF_UNIX one,
+ * which the dispatcher translates? One it cannot read is left to the call,
+ * which answers EFAULT for it, from the handler as before. */
+static int sun_family(const void *sa, long len, int *unreadable) {
+    unsigned short fam = 0;
+    *unreadable = 0;
+    if (!sa || len < (long)sizeof fam)
+        return 0;
+    if (cng_user_copyin(&fam, sa, sizeof fam) < 0) {
+        *unreadable = 1;
+        return 0;
+    }
+    return fam == CNG_AF_UNIX;
+}
+
+/* Can an open of `p` (translated, against `dirfd`) with `oflags` block? A
+ * FIFO's does until its other end is opened, and a character device's can (a
+ * serial line waiting for carrier), never with O_NONBLOCK; O_PATH and
+ * O_DIRECTORY open nothing to wait on. The memory devices (major 1: null,
+ * zero, random, ...) never block on open, and are most of the device opens
+ * there are. One fstatat, unpinned: a wrong answer costs a bounce, or an open
+ * that blocks in the handler as every open used to, never the open itself. */
+static int open_blocks(long dirfd, const char *p, long oflags) {
+    if (oflags & (CNG_O_NONBLOCK | CNG_O_PATH | CNG_O_DIRECTORY))
+        return 0;
+    char st[144];
+    if (CNG_SYS(__NR_newfstatat, dirfd, (long)p, (long)st,
+                (oflags & CNG_O_NOFOLLOW) ? CNG_AT_SYMLINK_NOFOLLOW : 0, 0,
+                0) != 0)
+        return 0;
+    unsigned type = *(unsigned *)(st + 16) & CNG_S_IFMT; /* st_mode */
+    if (type == 0010000u /* S_IFIFO */)
+        return 1;
+    if (type != 0020000u /* S_IFCHR */)
+        return 0;
+    unsigned long long rdev = *(unsigned long long *)(st + 32); /* st_rdev */
+    return (((rdev >> 8) & 0xfff) | ((rdev >> 32) & ~0xfffull)) != 1;
+}
+
+/* A tracee's call that the dispatcher makes as it stands and that can block:
+ * a tracee traps every syscall, so here are the ones that wait — on a pipe, a
+ * socket or a terminal, a futex, a lock, a timer. Its synthesized /proc files
+ * (fds from cng_g_synth_fd_base up) are regenerated before a read, and never
+ * block; an emulated netlink socket's read is not made as it stands either
+ * (see the read case). The mask-taking waits never get here (sigsys.c bounces
+ * them), nor the socket calls and opens, which have cases of their own. */
+static int tracee_blocks(long nr, long a0, long a1) {
+    switch (nr) {
+    case __NR_read:
+    case __NR_readv:
+    case __NR_pread64:
+    case __NR_preadv:
+    case __NR_preadv2:
+        return (!cng_g_synth_fd_base || a0 < cng_g_synth_fd_base) &&
+               !cng_nl_is_fake((int)a0);
+    case __NR_fcntl:
+        return a1 == 7 /*F_SETLKW*/ || a1 == 38 /*F_OFD_SETLKW*/;
+    case __NR_write:
+    case __NR_writev:
+    case __NR_pwrite64:
+    case __NR_pwritev:
+    case __NR_pwritev2:
+    case __NR_futex:
+    case __NR_nanosleep:
+    case __NR_clock_nanosleep:
+    case __NR_flock:
+    case __NR_splice:
+    case __NR_tee:
+    case __NR_vmsplice:
+    case __NR_sendfile:
+    case __NR_io_getevents:
+    case __NR_io_pgetevents:
+    case __NR_io_uring_enter:
+    case __NR_mq_timedsend:
+    case __NR_mq_timedreceive:
+        return 1;
+    }
+    return 0;
 }
 
 /* --- /proc magic links ---------------------------------------------------
@@ -1334,12 +1554,20 @@ int cng_resolve_lim(const char *path, int deref_final, char *out, size_t outsz,
             /* ...unless the link is the l2s emulation's own, which to the
              * guest is a regular file and not a symlink at all: refusing it
              * made openat2(RESOLVE_NO_SYMLINKS) ELOOP on an emulated hardlink
-             * where a real one opens. */
-            char d[CNG_PATH_MAX];
+             * where a real one opens. A member of one of proot's groups
+             * names its data file only through a second link, the
+             * indirection, which is no more the guest's symlink than the
+             * first: the walk goes on from the data file itself. (A link of
+             * our own names the data file by its text, as it stands.) */
+            char d[CNG_PATH_MAX], dg[CNG_PATH_MAX];
             if (!(cng_g_l2s && cng_l2s_resolve(host, d, sizeof d, 0) == 1)) {
                 lim->err = -ELOOP;
                 return -ELOOP;
             }
+            const char *lb = strrchr(link, '/'), *db = strrchr(d, '/');
+            if (strcmp(lb ? lb + 1 : link, db ? db + 1 : d) != 0 &&
+                cng_host_dir_guest(d, dg, sizeof dg) == 0)
+                cng_strlcpy(link, dg, sizeof link);
         }
         if (++nlinks > 40)
             return -ELOOP;
@@ -1841,22 +2069,50 @@ int cng_scope_needs_walk(long dirfd, char *gdir, size_t sz) {
     if (dfd == CNG_AT_FDCWD) {
         /* The virtual cwd, which is the guest's own answer — the host cwd is
          * only its translation and would have to be mapped back. */
-        if (cng_fs_cwd(gdir, sz) >= sz)
+        if (cng_fs_cwd(gdir, sz) >= sz) {
+            gdir[0] = '\0';
             return 0;
+        }
     } else {
         char hdir[CNG_PATH_MAX];
-        if (dirfd_host(dfd, hdir, sizeof hdir) != 0)
+        if (dirfd_host(dfd, hdir, sizeof hdir) != 0) {
+            gdir[0] = '\0';
             return 0;
+        }
         /* The zones are named too (the synthesized /proc files and the
          * hidden-process view live under a dirfd like that, and they are
          * exactly what the kernel's own resolution would miss). A directory
          * the guest has no name for is refused, not handed to the kernel to
          * scope a resolution under: the scoping keeps the answer beneath that
          * directory, and beneath it is still outside the view. */
-        if (host_dir_guest(hdir, gdir, sz) != 0)
+        if (host_dir_guest(hdir, gdir, sz) != 0) {
+            gdir[0] = '\0';
             return fd_is_dir(dfd) ? -1 : 0;
+        }
     }
     return scope_overlay(gdir);
+}
+
+/* A scoped openat2 that has to be walked, against a dirfd cng_scope_needs_walk
+ * could not name (`gdir` came back empty): there is no scope to walk from.
+ * What the kernel answers there instead, in path_init()'s order — an absolute
+ * name under BENEATH is EXDEV before the descriptor is looked at, then a number
+ * that is no descriptor is EBADF and one on anything but a directory ENOTDIR.
+ * What is left is a directory with no name the guest could have used, which
+ * is refused as every other route refuses it. */
+static long scope_unnamed(long dirfd, const char *gp, unsigned long resolve) {
+    int dfd = (int)dirfd;
+    if (gp && gp[0] == '/' && (resolve & CNG_RESOLVE_BENEATH))
+        return -EXDEV;
+    if (dfd != CNG_AT_FDCWD) {
+        char st[STAT_BUF_SIZE];
+        long e = sys_fstat(dfd, st);
+        if (e < 0)
+            return e;
+        if ((*(unsigned *)(st + STAT_MODE_OFF) & CNG_S_IFMT) != CNG_S_IFDIR)
+            return -ENOTDIR;
+    }
+    return -EACCES;
 }
 
 /* at_canon() for a scoped openat2: the same lexical canonicalization the
@@ -2072,6 +2328,15 @@ static long ro_refusal_name(long dirfd, const char *gp, const char *host,
     return ro_refusal(host, atflags);
 }
 
+/* The script the running program was exec'd to interpret, when that exec ran
+ * it from one of our fds: the number and the file it named at the commit. */
+static int g_script_fd = -1;
+static struct cng_fdid g_script_id;
+
+void cng_fd_reopen_script(int fd) {
+    g_script_fd = cng_fdid_of(fd, &g_script_id) == 0 ? fd : -1;
+}
+
 /* An open the host refused on a path naming one of *our own* fds. We hold that
  * descriptor, so the guest can still be served — two distinct refusals, two
  * answers (apk 3 runs into both when it execs a package script and the shebang
@@ -2080,13 +2345,26 @@ static long ro_refusal_name(long dirfd, const char *gp, const char *host,
  *  - the inode already grants us the access asked for, so the refusal did not
  *    come from DAC. On Android that is SELinux declining an app an `open` on
  *    the tmpfs inode behind a memfd — where apk 3 keeps its scripts (mode 0777,
- *    owned by us). A fresh description of the same file is exactly what the
- *    open would have produced: duplicate ours and rewind it. The duplicate
- *    shares the original's file offset, hence the rewind — a real open always
- *    starts at 0.
+ *    owned by us). A fresh description of the same file is what the open would
+ *    have produced, and a duplicate of ours is one when its access mode is the
+ *    one asked for: duplicate it and rewind it. The duplicate shares the
+ *    original's file offset, hence the rewind — a real open always starts
+ *    at 0.
  *  - the inode denies it and the guest is fake-root: real root would have
  *    bypassed DAC, so lend the inode the owner bit *through the fd* (no path
  *    race), reopen properly, and put the mode straight back.
+ *
+ * A duplicate of a *wider* description is not what was asked for. memfd_create
+ * only makes O_RDWR files, and reopening one O_RDONLY through its own link is
+ * the one way to a read-only description of it — how Chrome makes the read-only
+ * half of every shared-memory region, which it checks with F_GETFL before it
+ * hands it to a less trusted process. An O_RDWR duplicate failed that CHECK and
+ * killed the browser; the host's refusal is what proot and a native process
+ * get, and Chrome answers it by falling back to a file under /dev/shm. So a
+ * narrower open gets `err`, with one exception: the script a #! exec ran from
+ * this fd (cng_fd_reopen_script), opened O_RDONLY. Its interpreter only reads
+ * it — busybox sh running an apk 3 package script — and was handed nothing it
+ * could open otherwise.
  *
  * Returns the new fd, or `err` unchanged when this is not that case. */
 long cng_fd_reopen(const char *host, long flags, long mode, long err) {
@@ -2115,8 +2393,10 @@ long cng_fd_reopen(const char *host, long flags, long mode, long err) {
         long cur = CNG_SYS(__NR_fcntl, fd, 3 /*F_GETFL*/, 0, 0, 0, 0);
         if (cur < 0)
             return err;
-        if ((cur & 3) != CNG_O_RDWR && (cur & 3) != acc)
-            return err; /* our fd cannot serve that access mode */
+        if ((cur & 3) != acc &&
+            !((cur & 3) == CNG_O_RDWR && acc == CNG_O_RDONLY &&
+              fd == g_script_fd && cng_fd_is(fd, &g_script_id)))
+            return err; /* a duplicate would not have that access mode */
         long nfd = CNG_SYS(__NR_fcntl, fd,
                            ((int)flags & CNG_O_CLOEXEC) ? 1030 /*F_DUPFD_CLOEXEC*/
                                                         : 0 /*F_DUPFD*/,
@@ -2383,10 +2663,13 @@ static long rl_fdlink(long dirfd, const char *host, long ubuf, int bufsiz) {
     long ol = tl;
     if ((size_t)tl < sizeof tgt && tgt[0] == '/') {
         tgt[tl] = '\0';
-        /* A synthesized /proc file's fd is a memfd named after it: the link
-         * says so, not "memfd:... (deleted)". */
-        if (cng_fs_untranslate(cng_g_fs, tgt, guest, sizeof guest) == 0 ||
-            (!cng_g_no_proc && cng_procfs_link_name(tgt, guest, sizeof guest))) {
+        /* A synthesized /proc file's fd is a memfd named after it, or a file
+         * of ours that is: the link says so, not "memfd:... (deleted)". Asked
+         * first, since the file can sit inside the view — $TMPDIR under a
+         * -b bind of the temp directory — where untranslating it would name
+         * the directory instead. */
+        if ((!cng_g_no_proc && cng_procfs_link_name(tgt, guest, sizeof guest)) ||
+            cng_fs_untranslate(cng_g_fs, tgt, guest, sizeof guest) == 0) {
             out = guest;
             ol = (long)strlen(guest);
         }
@@ -2900,9 +3183,9 @@ static long openat2_scoped(long dirfd, long path,
         /* O_PATH so nothing is opened for real, and the caller's own
          * O_NOFOLLOW carried over — ro_refusal() passes AT_SYMLINK_NOFOLLOW the
          * same way, or a write-open of a dangling link reads as absent. Raw,
-         * not reissue(): the precheck above has already answered ENOSYS for a
-         * blocked openat2, so nothing reaches this line where the number would
-         * trap. */
+         * not reissue(): where openat2 cannot be issued the call is emulated
+         * by the walk and never comes here, so nothing reaches this line where
+         * the number would trap. */
         probe.flags = CNG_O_PATH | CNG_O_CLOEXEC | (oflags & CNG_O_NOFOLLOW);
         probe.mode = 0;
         long e = cng_syscall6(dirfd, path, (long)&probe, (long)sizeof probe, 0,
@@ -2925,7 +3208,9 @@ static long openat2_scoped(long dirfd, long path,
      * an absolute one at the HOST root, where BENEATH had nothing left to
      * refuse and IN_ROOT nothing to re-root (ENOENT for both) — and
      * RESOLVE_NO_SYMLINKS was added, which turned every link the scope would
-     * have followed or refused into ELOOP. */
+     * have followed or refused into ELOOP. The caller walks a scoped call
+     * itself wherever openat2 cannot be issued; the check stays so that a
+     * blocked number can never trap from inside the handler. */
     if (cng_blocked[__NR_openat2]) {
         cng_note_blocked(__NR_openat2);
         return -ENOSYS;
@@ -2992,17 +3277,15 @@ static long read_open_how(long a2, unsigned long size, struct cng_open_how *out)
  * validates the struct, then fails the empty path. Returns 0 when the how is
  * good, else the errno the kernel gave it.
  *
- * Where the ambient filter refuses openat2 there is no kernel to ask: this runs
+ * Where openat2 cannot be issued there is no kernel to ask, and the call is
+ * being emulated: the rules are applied here instead (how_validate). Asking
+ * anyway is no option where the ambient filter refuses the number — this runs
  * inside the SIGSYS handler, so a raw re-issue of a blocked number is the
- * nested trap the whole design avoids — measured on an Android 13 device,
- * which blocks openat2 outright and killed the process here. ENOSYS is the
- * answer reissue() already gives every other blocked syscall, and it is what
- * the guest would see from a kernel that has no openat2 at all. */
+ * nested trap the whole design avoids (measured on an Android 13 device, which
+ * blocks openat2 outright and killed the process here). */
 static long how_precheck(const struct cng_open_how *how) {
-    if (cng_blocked[__NR_openat2]) {
-        cng_note_blocked(__NR_openat2);
-        return -ENOSYS;
-    }
+    if (openat2_absent())
+        return how_validate(how);
     long r = cng_syscall6(CNG_AT_FDCWD, (long)"", (long)how, (long)sizeof *how,
                           0, 0, __NR_openat2);
     if (r >= 0) {
@@ -3244,6 +3527,99 @@ static int pid_hidden(long pid) {
     return !cng_g_no_proc && p > 0 && !cng_procreg_has_task(p);
 }
 
+/* The signal family under the view (see the kill case). The registry is what
+ * tells a guest from a host process, so with none (CNG_PROCREG_NONE, a host
+ * that could map nothing) every other pid would read as hidden — a shell could
+ * not signal its own job — and they run native there, untrapped. */
+static int sig_view(void) {
+    return !cng_g_no_proc && cng_g_procreg_backing != CNG_PROCREG_B_NONE;
+}
+
+/* A pid nobody holds: above PID_MAX_LIMIT (4M), which /proc/sys/kernel/pid_max
+ * cannot exceed. A call aimed at a hidden process is re-issued at this one, so
+ * the kernel gives the ESRCH it gives for a pid that does not exist, from the
+ * same place — after whatever it checks first (a bad siginfo pointer, a forged
+ * si_code, a tid of zero), which then keeps its own answer. */
+#define PID_NONE 0x7fffffffL
+
+static long sig_target(long pid) {
+    return sig_view() && pid_hidden(pid) ? PID_NONE : pid;
+}
+
+/* One process of a group or broadcast kill: as kill(pid, sig) would, a
+ * tracee's stop signal included. */
+static long kill_one(int pid, int sig) {
+    if (cng_pt_signal_route(pid, sig))
+        return 0;
+    return reissue(pid, sig, 0, 0, 0, 0, __NR_kill);
+}
+
+/* kill(0), kill(-pgrp) and kill(-1) name processes by group or all at once,
+ * and the kernel would signal host processes among them: the host shell or
+ * pipeline the guest was started from shares its group (`trap 'kill 0' EXIT`
+ * reached the script that ran chroot-ng), and kill(-1) — a shutdown script,
+ * killall5 — reached every process of the user. So each one the view shows is
+ * signalled in turn instead, and the answer is put together the way the kernel
+ * puts it together (kill_something_info, __kill_pgrp_info):
+ *   - a group: 0 if any member took the signal, else the last refusal, and
+ *     ESRCH for a group with no member in the view;
+ *   - kill(-1): every process but pid 1 and the caller's own, 0 unless one
+ *     refused for a reason other than EPERM, and ESRCH when there is none.
+ * The caller, when it is a member, goes last: its own SIGKILL or SIGSTOP would
+ * take effect on the way out of the first kill and leave the rest unsent.
+ *
+ * Not atomic, which the kernel's is: it signals the whole group under one
+ * lock, and a fork that races it either restarts or hands the signal to the
+ * child as well. Here a member forked during the pass is caught by passing
+ * again until a pass finds no one new (each process once, by its slot); one
+ * whose parent has not yet published it when the last pass ends is missed. */
+static long kill_some(int pid, int sig) {
+    int me = (int)sys_getpid();
+    long pgrp = 0;
+    if (pid == 0)
+        pgrp = CNG_SYS(__NR_getpgid, 0, 0, 0, 0, 0, 0);
+    else if (pid != -1)
+        pgrp = -(long)pid;
+    int n = cng_procreg_slots();
+    u64 seen[(CNG_PROCREG_MAX + 63) / 64];
+    memset(seen, 0, sizeof seen);
+    int count = 0, success = 0, self = 0;
+    long ret = -ESRCH, retval = 0;
+    for (int fresh = 1; fresh;) {
+        fresh = 0;
+        for (int i = 0; i < n; i++) {
+            if (seen[i / 64] & (1ULL << (i % 64)))
+                continue;
+            int p = cng_procreg_pid_at(i);
+            if (p <= 0)
+                continue;
+            if (pid == -1 ? p <= 1 || p == me
+                          : CNG_SYS(__NR_getpgid, p, 0, 0, 0, 0, 0) != pgrp)
+                continue;
+            seen[i / 64] |= 1ULL << (i % 64);
+            fresh = 1;
+            if (p == me) {
+                self = 1;
+                continue;
+            }
+            long err = kill_one(p, sig);
+            count++;
+            success |= err == 0;
+            ret = err;
+            if (err != -EPERM)
+                retval = err;
+        }
+    }
+    if (self) {
+        long err = kill_one(me, sig);
+        success |= err == 0;
+        ret = err;
+    }
+    if (pid == -1)
+        return count ? retval : -ESRCH;
+    return success ? 0 : ret;
+}
+
 /* FIDEDUPERANGE: the descriptor is the source, and the destinations are the
  * dest_fd fields of the argument — each of which the kernel takes write
  * access on the mount for (vfs_dedupe_file_range_one), answering per
@@ -3387,6 +3763,180 @@ static void scm_rights_close_one(int fd) {
         sys_close(fd);
 }
 
+/* ---- SCM_CREDENTIALS under a fake identity ------------------------------
+ *
+ * A credentials record names its sender by pid, uid and gid, and the kernel
+ * holds a sender to the ids it claims (scm_check_creds): the uid must be its
+ * real, effective or saved one unless CAP_SETUID says any will do, the gid
+ * likewise by CAP_SETGID. Under --fake-id a guest claims its fake ids — GLib's
+ * g_unix_connection_send_credentials sends getpid(), geteuid(), getegid(),
+ * and every GDBus client does that before it authenticates — and the kernel,
+ * judging them against the real ones, answered EPERM: a fake root's session
+ * reached no D-Bus service at all ("Error sending credentials: ... Operation
+ * not permitted", and XFCE's "Unable to contact settings server"). Going out,
+ * the claim is judged here by the same rule against the fake set and, when it
+ * holds, spelled in the host's own ids, which the kernel accepts; coming in,
+ * the sender is named as SO_PEERCRED names a peer (peer_ids).
+ *
+ * What the host's ids cannot carry is which of the fake ids was claimed, so
+ * the sender records its claim beside the ids it publishes (procreg.h), and
+ * the receiver looks the sender up by the record's pid. That is a claim per
+ * process, not per message: a record that claimed nothing (SO_PASSCRED's own)
+ * from a process that claimed before reads as that claim, which matters only
+ * when the two differ, its real ids not being the ones it claimed. Records
+ * still queued when the sender claims again, or changes its ids, read as the
+ * newer state. The pid is the kernel's to judge, a guest's pids being the
+ * host's: the CAP_SYS_ADMIN that would let a fake root name another process
+ * is not one the host grants it. */
+
+/* The ids a socket peer goes by in the guest view, from what the kernel named
+ * it by: its pid, and the host ids it had. The kernel takes those out of the
+ * peer's struct cred, and under --fake-id every guest process has the host's
+ * ids there, so the peer's fake set is asked for instead, in the registry it
+ * publishes it into. That is its set now, not the one the kernel recorded at
+ * connect(), listen() or socketpair(): a peer that changed its ids since then
+ * is named by the new ones. SO_PEERCRED names the effective ids; a
+ * credentials record (`scm`) the claim the sender's last record made, else
+ * the real ids SO_PASSCRED attaches to a message that carried no record. Any
+ * other peer — a host process, one that is gone or whose pid was reused,
+ * another invocation's — is remapped as a file's owner is, to the identity the
+ * run was started with. `n` is how many bytes of the triple are there: an id
+ * the kernel's copy was cut inside is left as it was. */
+static void peer_ids(unsigned uc[3], unsigned long n, int scm) {
+    struct cng_procids p;
+    int have = n >= sizeof(unsigned) && cng_procreg_ids((int)uc[0], &p) &&
+               p.fake;
+    if (n >= 2 * sizeof(unsigned)) {
+        if (have && uc[1] == cng_g_host_uid)
+            uc[1] = !scm ? p.euid : p.claim ? p.claim_uid : p.ruid;
+        else
+            uc[1] = cng_remap_uid(uc[1]);
+    }
+    if (n >= 3 * sizeof(unsigned)) {
+        if (have && uc[2] == cng_g_host_gid)
+            uc[2] = !scm ? p.egid : p.claim ? p.claim_gid : p.rgid;
+        else
+            uc[2] = cng_remap_gid(uc[2]);
+    }
+}
+
+/* getsockopt(SOL_SOCKET, SO_PEERGROUPS): the peer's supplementary groups,
+ * which the kernel takes out of the struct cred SO_PEERCRED names the peer
+ * from. A peer the kernel names by the host's ids is told apart as peer_ids
+ * does it: a guest's are the groups it publishes beside its ids, and any
+ * other's are those of the identity the run began as, which are none (the
+ * fake set starts with none). They used to be the host's, which no guest has
+ * — on Android the app's 3003, 9997, 20337 and so on, whoever the peer was.
+ * A peer named by any other ids is the kernel's to describe, and so is every
+ * error before there is a peer to describe: the length word's EFAULT and
+ * then EINVAL for a negative one, as sk_getsockopt takes it, and then the
+ * option's own ENODATA (no peer) or ENOPROTOOPT (a kernel before 4.13). Then
+ * ERANGE with the length the list needs written back, the list, and the
+ * length it took. */
+static long peer_groups(long fd, long optval, long optlen) {
+    int len;
+    if (cng_user_copyin(&len, (void *)optlen, sizeof len) < 0)
+        return -EFAULT;
+    if (len < 0)
+        return -EINVAL;
+    int probe = 0; /* no room: 0 or ERANGE says there is a peer to describe */
+    long r = reissue(fd, CNG_SOL_SOCKET, CNG_SO_PEERGROUPS, 0, (long)&probe, 0,
+                     __NR_getsockopt);
+    if (r != 0 && r != -ERANGE)
+        return r;
+    unsigned uc[3] = {0, 0, 0}; /* struct ucred: pid,uid,gid */
+    int ul = sizeof uc;
+    if (reissue(fd, CNG_SOL_SOCKET, CNG_SO_PEERCRED, (long)uc, (long)&ul, 0,
+                __NR_getsockopt) != 0 ||
+        uc[1] != cng_g_host_uid)
+        return reissue(fd, CNG_SOL_SOCKET, CNG_SO_PEERGROUPS, optval, optlen, 0,
+                       __NR_getsockopt);
+    u32 g[CNG_PROCREG_GROUPS], n = 0;
+    struct cng_procids p;
+    if (!cng_procreg_cred((int)uc[0], &p, g, &n) || !p.fake)
+        n = 0;
+    int need = (int)(n * sizeof *g);
+    if (len < need)
+        return cng_user_copyout((void *)optlen, &need, sizeof need) < 0
+                   ? -EFAULT
+                   : -ERANGE;
+    if (n && cng_user_copyout((void *)optval, g, (unsigned long)need) < 0)
+        return -EFAULT;
+    return cng_user_copyout((void *)optlen, &need, sizeof need) < 0 ? -EFAULT
+                                                                    : 0;
+}
+
+/* Each SOL_SOCKET SCM_CREDENTIALS record in a control buffer of ours, walked
+ * as __scm_send walks one (and scm_rights_walk above): a record that is not
+ * CMSG_OK ends it, which is where the kernel stops with EINVAL. `fn` gets the
+ * payload's ids and its length — a received record cut short (MSG_CTRUNC)
+ * carries less than a whole struct ucred, a sent one may carry more — and
+ * what it leaves in the ids goes back into the buffer. Returns how many
+ * records it handed over. */
+static int scm_creds_walk(char *control, unsigned long len,
+                          void (*fn)(unsigned uc[3], unsigned long n)) {
+    int seen = 0;
+    unsigned long off = 0;
+    while (off + sizeof(struct cng_cmsghdr) <= len) {
+        struct cng_cmsghdr ch;
+        memcpy(&ch, control + off, sizeof ch);
+        if (ch.len < sizeof ch || ch.len > len - off)
+            break;
+        if (ch.level == CNG_SOL_SOCKET && ch.type == CNG_SCM_CREDENTIALS) {
+            unsigned uc[3] = {0, 0, 0}; /* struct ucred: pid, uid, gid */
+            unsigned long n = ch.len - sizeof ch;
+            unsigned long k = n < sizeof uc ? n : sizeof uc;
+            char *p = control + off + sizeof ch;
+            memcpy(uc, p, k);
+            fn(uc, n);
+            memcpy(p, uc, k);
+            seen++;
+        }
+        off += (ch.len + 7) & ~7UL; /* CMSG_ALIGN */
+    }
+    return seen;
+}
+
+/* Going out: a claim the fake set allows by scm_check_creds's rule is spelled
+ * in the host's ids. One it refuses gets pid 0, which no task has, so the
+ * kernel refuses the record in its own place among the others and with its
+ * own EPERM (ESRCH, where the host really is privileged and lets any pid be
+ * named). A record of the wrong length is left for the kernel's EINVAL, and
+ * so is an id of -1, which no namespace maps — that EINVAL comes before the
+ * EPERM in the kernel's order, so the record must reach it as it was. */
+static void scm_creds_claim(unsigned uc[3], unsigned long n) {
+    if (n != 3 * sizeof(unsigned) || uc[1] == ~0u || uc[2] == ~0u)
+        return;
+    struct cng_cred_ids id;
+    cng_cred_ids(&id);
+    int priv = id.euid == 0; /* the full capability set (cred.c) */
+    if ((priv || uc[1] == id.ruid || uc[1] == id.euid || uc[1] == id.suid) &&
+        (priv || uc[2] == id.rgid || uc[2] == id.egid || uc[2] == id.sgid)) {
+        cng_procreg_claim(uc[1], uc[2]); /* for the receiver (peer_ids) */
+        uc[1] = cng_g_host_uid;
+        uc[2] = cng_g_host_gid;
+    } else {
+        uc[0] = 0;
+    }
+}
+
+/* Coming in: the kernel names the sender by its real ids (its own claim made
+ * good, or the ids SO_PASSCRED attaches to a message that carried none), and
+ * the guest gets the ones the sender goes by. An id the record was cut short
+ * inside is left as the kernel cut it: the rest of it is not in the buffer to
+ * be judged. */
+static void scm_creds_seen(unsigned uc[3], unsigned long n) {
+    peer_ids(uc, n, 1);
+}
+
+/* Is this a sendmsg header whose control data has room for a credentials
+ * record that has to be judged here? Shorter than one, any such record is
+ * the kernel's EINVAL whatever it claims. */
+static int ctl_may_carry_creds(const struct cng_msghdr *h) {
+    return cng_g_fake_id && h->control &&
+           h->controllen >= sizeof(struct cng_cmsghdr) + 3 * sizeof(unsigned);
+}
+
 /* Does a recvmsg header ask for control data that could carry descriptors? A
  * buffer shorter than one SCM_RIGHTS record with a single descriptor in it
  * receives none: scm_detach_fds installs nothing into it and reports
@@ -3406,6 +3956,8 @@ static int ctl_may_carry_fds(const struct cng_msghdr *h) {
  * out of the numbers the kernel wrote rather than out of the guest's buffer
  * a syscall later, where another thread of the guest could have rewritten
  * them into numbers of its choosing and kept the one that was to be closed.
+ * A credentials record's ids are remapped in that buffer too, under a fake
+ * identity (scm_creds_seen), so the real ones never reach the guest's memory.
  * The records then go out to the guest in one copy.
  *
  * The control bounce is exact: a buffer up to CTL_BOUNCE is taken at its own
@@ -3414,9 +3966,12 @@ static int ctl_may_carry_fds(const struct cng_msghdr *h) {
  * and only then): AF_UNIX is the one family that can deliver descriptors,
  * and it never produces more than an SCM_RIGHTS record of SCM_MAX_FD (253)
  * descriptors, a credentials record and a security label — well under the
- * bound — so its buffer is taken at CTL_BOUNCE with nothing lost; any other
- * family's stays the guest's own, since nothing arriving on it needs
- * admitting and a raw IPv6 socket's extension headers can run past the bound.
+ * bound — so its buffer is taken at CTL_BOUNCE with nothing lost. So is
+ * AF_NETLINK's under a fake identity, the other family that delivers a
+ * credentials record (with nothing else but a group number and a namespace
+ * id beside it). Any other family's stays the guest's own, since nothing
+ * arriving on it needs admitting or remapping, and a raw IPv6 socket's
+ * extension headers can run past the bound.
  *
  * A guest control buffer that will not take the records is answered as the
  * kernel answers a control buffer it cannot write: no descriptor is left
@@ -3444,7 +3999,8 @@ recvmsg_bounced(long fd, struct cng_msghdr *g, const struct cng_msghdr *snap,
             unsigned dlen = sizeof dom;
             if (CNG_SYS(__NR_getsockopt, fd, CNG_SOL_SOCKET, CNG_SO_DOMAIN,
                         &dom, &dlen, 0) == 0 &&
-                dom != CNG_AF_UNIX)
+                dom != CNG_AF_UNIX &&
+                !(cng_g_fake_id && dom == CNG_AF_NETLINK))
                 bctl = 0;
             else
                 cl = sizeof cb;
@@ -3461,6 +4017,8 @@ recvmsg_bounced(long fd, struct cng_msghdr *g, const struct cng_msghdr *snap,
         unsigned long cl = mh.controllen;
         if (cl > sizeof cb)
             cl = sizeof cb; /* not a length the kernel reports; bounded anyway */
+        if (cng_g_fake_id)
+            scm_creds_walk(cb, cl, scm_creds_seen);
         /* Handed over before it is judged: a record the guest could not be
          * given is taken back whole, and every number in it is still the
          * kernel's fresh install at that point — judged first, a number the
@@ -3492,6 +4050,28 @@ recvmsg_bounced(long fd, struct cng_msghdr *g, const struct cng_msghdr *snap,
     if (flags_out)
         *flags_out = mh.flags;
     return r;
+}
+
+/* One sendmsg whose control data may carry a credentials record under a fake
+ * identity (ctl_may_carry_creds): the data is taken into a buffer of ours,
+ * each record's claim is judged and spelled for the kernel there
+ * (scm_creds_claim), and the kernel is handed our copy when there was one —
+ * the guest's own buffer is never written, and what the kernel reads is what
+ * was judged. `mh` is our copy of the header, its name already translated.
+ * A buffer the copy cannot take is sent as it stands, for the kernel to
+ * answer: one that will not come across is its EFAULT, and one longer than
+ * CTL_BOUNCE is past anything a sender builds — a message carries SCM_MAX_FD
+ * (253) descriptors at most, which with a credentials record is a little over
+ * a kilobyte. A function of its own for the buffer, as recvmsg_bounced is. */
+__attribute__((noinline)) static long sendmsg_creds(long fd,
+                                                    struct cng_msghdr *mh,
+                                                    long flags) {
+    char cb[CTL_BOUNCE];
+    unsigned long cl = mh->controllen;
+    if (cl <= sizeof cb && cng_user_copyin(cb, mh->control, cl) == 0 &&
+        scm_creds_walk(cb, cl, scm_creds_claim))
+        mh->control = cb;
+    return reissue(fd, (long)mh, flags, 0, 0, 0, __NR_sendmsg);
 }
 
 /* Run the readback translation over an address the kernel just wrote into our
@@ -3642,6 +4222,10 @@ static long mmsg_deadline_report(struct mmsg_deadline *d, long tp,
     return 0;
 }
 
+/* Test aids, see monitor.h: each side's first moment out of a converted clone. */
+void (*cng_g_fork_child_probe)(void);
+void (*cng_g_fork_parent_probe)(long kid);
+
 /* clone, for the process-making kinds the tiers trap (a thread's clone runs
  * natively on both: the filter tests CLONE_VM/CLONE_VFORK, tramp.S does the
  * same). `ur` is the guest's register frame — the SIGSYS tier's signal context
@@ -3668,13 +4252,39 @@ static long mmsg_deadline_report(struct mmsg_deadline *d, long tp,
  *    parent's stack, so the frame's sp is left alone. A bare glibc vfork hands
  *    the parent's own sp, which is the same value the frame already holds.
  * The parent then publishes the child into the PID registry, which is what
- * makes the new process visible as a guest one. The child cannot do this
- * itself: nothing guarantees it makes another traced syscall before something
- * reads its /proc entry — and a tracer attaching to it by pid needs it to be a
- * known guest process. */
+ * makes the new process visible as a guest one. The child cannot be left to
+ * do this alone: nothing guarantees it makes another traced syscall before
+ * something reads its /proc entry — and a tracer attaching to it by pid needs
+ * it to be a known guest process. It does wait for it, though, before it runs
+ * any guest code, and copies the entry itself if the parent does not come
+ * through: one the scheduler had not run again since its clone left a child
+ * that went on to fork with no entry of its own to copy, and that child's
+ * own child stayed invisible for good.
+ *
+ * Every signal but SIGSYS is blocked from before the fork until each side is
+ * done here, which is the mask the SIGSYS tier's handler runs all of this
+ * under anyway. The -R trampoline runs it on the guest's own mask, and the
+ * child's hooks rebuild per-process state that came across the fork describing
+ * the parent: a handler delivered to the child on the way out of the clone ran
+ * against the parent's state, and whatever it recorded was then wiped by the
+ * hooks. That is how a PTRACE_ATTACH was lost. The parent handed the new pid
+ * over as soon as its fork returned, and the tracer's attach kick reached the
+ * child before cng_pt_fork_child had run. The child attached, stopped and was
+ * resumed, and the hook then cleared the per-task table the attach lived in,
+ * so the tracee never stopped again and its exit was never published (the
+ * tracer, finding a zombie, reported it killed by SIGKILL). SIGSYS stays open
+ * for the gate-net, as in the handler, because a masked seccomp SIGSYS kills.
+ * The child inherits the blocked mask, and each side puts the guest's back
+ * once it is done with the fork. An attach sent as a SIGSYS of ours, to a
+ * thread that holds the kick blocked, is not held back by any mask, so the
+ * child marks the window as a handler's own work, where that request is left
+ * for later (sigsys.c, sigsys_kick); the kick lands once the guest's mask is
+ * back, or the tracer sends the SIGSYS again. */
 void cng_clone_convert(struct cng_uregs *ur) {
     unsigned long orig_flags = (unsigned long)ur->x[0];
     unsigned long child_stack = (unsigned long)ur->x[1];
+    unsigned long hold = ~0UL & ~(1UL << (CNG_SIGSYS - 1)), mask = 0;
+    CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, &hold, &mask, 8, 0, 0);
     /* Decided before the fork, from the flags the guest asked for: the
      * conversion below erases CLONE_VFORK, and a tracer following vforks must
      * still see EVENT_VFORK rather than EVENT_FORK. */
@@ -3685,14 +4295,24 @@ void cng_clone_convert(struct cng_uregs *ur) {
     int nnp = cng_nnp_get();
     /* Same for the rseq registration the child inherits (execve.c). */
     int rseq_keep = cng_rseq_fork_prepare();
+    /* And for whose registry entry the child copies: by then its getppid
+     * names a parent only while that parent lives, and under CLONE_PARENT
+     * never this process at all. */
+    int forker = (int)sys_getpid();
     long flags = (long)(orig_flags &
                         ~(unsigned long)(CNG_CLONE_VM | CNG_CLONE_VFORK));
     long ret = cng_syscall6(flags, 0, (long)ur->x[2], (long)ur->x[3],
                             (long)ur->x[4], (long)ur->x[5], __NR_clone);
     if (ret == 0) {
+        cng_sig_in_handler(1);
+        if (cng_g_fork_child_probe)
+            cng_g_fork_child_probe();
+        cng_procreg_fork_child(forker); /* registered before any guest code */
         cng_nnp_fork_child(nnp); /* one task, holding what we held */
         cng_rseq_fork_child(rseq_keep);
         cng_exec_fork_child(); /* an exec another thread had in flight is not ours */
+        /* ...nor a bounced dispatch another thread was blocked in. */
+        __atomic_store_n(&g_disp_bounced, 0, __ATOMIC_RELAXED);
         /* The child inherited both the mappings and the attach list, so the
          * broker must count those attaches again (shm.c). */
         cng_shm_fork_child();
@@ -3700,10 +4320,15 @@ void cng_clone_convert(struct cng_uregs *ur) {
             ur->sp = child_stack;
         ur->x[0] = 0;
         cng_pt_fork_child(ur, ev);
+        cng_sig_in_handler(-1);
+        (void)cng_sig_take_deferred(); /* it is sent again: see above */
+        CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
         return;
     }
     ur->x[0] = (u64)ret;
     if (ret > 0) {
+        if (cng_g_fork_parent_probe)
+            cng_g_fork_parent_probe(ret);
         cng_procreg_fork((int)ret);
         cng_pt_report_event(ur, ev, (u64)ret);
         /* A real vfork would have suspended us until the child exec'd or
@@ -3712,10 +4337,13 @@ void cng_clone_convert(struct cng_uregs *ur) {
         if (orig_flags & CNG_CLONE_VFORK)
             cng_pt_report_event(ur, CNG_PTRACE_EVENT_VFORK_DONE, (u64)ret);
     }
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
 }
 
-long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
-                  int trapped) {
+/* One syscall, as cng_dispatch makes it the first time: see there for the
+ * second. */
+static long dispatch_1(long nr, long a0, long a1, long a2, long a3, long a4,
+                       long a5, int trapped) {
     char b1[CNG_PATH_MAX], b2[CNG_PATH_MAX];
 
     /* The address space an emulated execve retired, given back at the first
@@ -3816,6 +4444,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         return -ENOSYS;
     }
 
+    /* A tracee's waiting call, made as it stands: from guest context (see
+     * tracee_blocks). One Android refuses is left to be answered here. */
+    if (trapped == CNG_DISP_HANDLER && tracee_blocks(nr, a0, a1) &&
+        cng_pt_traceall() && !(nr < CNG_NR_MAX && cng_blocked[nr]))
+        return -CNG_EBOUNCE_RAW;
+
     switch (nr) {
     /* Simple translate + reissue: dirfd = a0, path = a1. */
     case __NR_openat:
@@ -3831,6 +4465,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         unsigned long resolve = 0;
         char sdir[CNG_PATH_MAX]; /* a scoped openat2's scope, as a guest path */
         int scoped = 0;          /* ...and whether this is one */
+        /* An openat2 the host cannot issue (see openat2_absent) is emulated:
+         * judged here as build_open_flags() would, every resolve bit answered
+         * by the walk — the scoped pair included, wherever the kernel would
+         * otherwise have been handed it — and made as the openat that is
+         * left once they are all stripped. */
+        int emul = 0;
         if (is_open) {
             oflags = a2;
             /* openat2's flags live in the open_how it points at, so reading
@@ -3843,6 +4483,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     return e;
                 oflags = (long)how.flags;
                 resolve = how.resolve;
+                if ((emul = openat2_absent())) {
+                    if (cng_blocked[__NR_openat2])
+                        cng_note_blocked(__NR_openat2);
+                    if ((e = how_validate(&how)))
+                        return e;
+                }
             }
         }
         /* RESOLVE_BENEATH / RESOLVE_IN_ROOT scope the whole resolution to
@@ -3861,11 +4507,20 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * bound over it, and a scoped name in /proc missed the synthesized
          * files entirely. Those are walked here instead, with the scope
          * applied by the walk (cng_resolve_lim) and then stripped from the
-         * re-issue, exactly as the other resolve bits already are. */
+         * re-issue, exactly as the other resolve bits already are — and so is
+         * every scoped call where openat2 is emulated, there being no kernel
+         * to hand the other kind to. */
         if (resolve & (CNG_RESOLVE_BENEATH | CNG_RESOLVE_IN_ROOT)) {
             int walk = cng_scope_needs_walk(a0, sdir, sizeof sdir);
             if (walk < 0)
                 return -EACCES; /* a directory the guest has no name for */
+            /* Emulated, there is no kernel to apply the scope, so the walk
+             * applies it everywhere — which needs the scope's name. */
+            if (!walk && emul) {
+                if (!sdir[0])
+                    return scope_unnamed(a0, (const char *)a1, resolve);
+                walk = 1;
+            }
             if (!walk)
                 return openat2_scoped(a0, a1, &how);
             /* From here we answer in place of the kernel, so the how has to be
@@ -3984,8 +4639,17 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     return ro;
             }
         }
-        long ha2 = a2, ha3 = a3;
-        if (nr == __NR_openat2) {
+        long ha2 = a2, ha3 = a3, rnr = nr;
+        if (emul) {
+            /* Every resolve bit is answered — RESOLVE_CACHED by how_validate,
+             * the rest by the walk — and how_validate has refused whatever
+             * openat would have stripped, so what is left IS an openat: the
+             * same flags and mode, and the same O_LARGEFILE the kernel adds to
+             * both forms (and O_PATH drops from both). */
+            rnr = __NR_openat;
+            ha2 = (long)how.flags;
+            ha3 = (long)how.mode;
+        } else if (nr == __NR_openat2) {
             /* Our copy, never the guest's struct: the constraints we answered
              * are cleared for the re-issue, and editing guest memory would
              * change what the caller believes it asked for. `size` becomes our
@@ -4016,23 +4680,29 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                    (nr == __NR_name_to_handle_at && !deref);
         if (l2nf && l2s_nofollow_data(rkd, rkp, 0, 0, l2d, sizeof l2d))
             p = l2d;
-        long r = reissue(a0, (long)p, ha2, ha3, a4, a5, nr);
+        /* A FIFO's open waits for the other end: from guest context, where a
+         * signal can end it (see open_blocks). The dispatch starts over there,
+         * so nothing above may have changed anything yet, and nothing has. */
+        if (trapped == CNG_DISP_HANDLER && is_open && open_blocks(a0, p, oflags))
+            return -CNG_EBOUNCE_DISP;
+        long r = reissue(a0, (long)p, ha2, ha3, a4, a5, rnr);
         /* O_NOFOLLOW through a real dirfd lands on the l2s symlink and draws
          * ELOOP where a real hardlink would open. Retry on the backing file —
          * never a symlink itself, so O_NOFOLLOW stays honored for real
          * guest symlinks. openat2 carries the flag in its open_how and drew
          * the same ELOOP; the retry re-issues our copy of that struct, its
-         * resolve constraints already answered and stripped. */
+         * resolve constraints already answered and stripped (or, emulated,
+         * the openat it became). */
         if (r == -ELOOP && is_open && (oflags & CNG_O_NOFOLLOW) &&
             l2s_nofollow_data(rkd, rkp, 0, 0, l2d, sizeof l2d))
-            r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, nr);
+            r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, rnr);
         /* A followed open draws it too, where the name the walk took for a file
          * became an l2s link before the kernel was handed it: a first link of
          * that file, made at the same moment (the pin refuses a final link the
          * walk never saw). Following the link is opening its backing file. */
         else if (r == -ELOOP && is_open && deref && cng_g_l2s &&
                  cng_l2s_resolve(p, l2d, sizeof l2d, 0) == 1)
-            r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, nr);
+            r = reissue(CNG_AT_FDCWD, (long)l2d, ha2, ha3, a4, a5, rnr);
         if ((r == -EACCES || r == -EPERM) && nr == __NR_openat)
             r = cng_fd_reopen(p, a2, a3, r);
         return r;
@@ -4155,8 +4825,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                                         data, sizeof data)) {
             if (l2s_ro(hnf, data))
                 return -EROFS;
-            return chattr_result(reissue(CNG_AT_FDCWD, (long)data, a2, a3, a4,
-                                         a5, nr));
+            return fchmodat2_result(reissue(CNG_AT_FDCWD, (long)data, a2, a3,
+                                            a4, a5, nr));
         }
         const char *p = xlate(a0, (const char *)a1, b1, sizeof b1, deref);
         if (xlate_bad(p))
@@ -4165,7 +4835,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                                   deref ? 0 : CNG_AT_SYMLINK_NOFOLLOW);
         if (ro)
             return ro;
-        return chattr_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
+        return fchmodat2_result(reissue(a0, (long)p, a2, a3, a4, a5, nr));
     }
 
     /* unlinkat: on removing one of our link2symlink names, drop the group's
@@ -4198,7 +4868,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * link2symlink entries, redirect to its backing file (the guest thinks it's
      * a regular file, so a set-then-lstat-verify — as apk does to preserve mtime
      * — must land on the backing, not the link). Setting an explicit time needs
-     * ownership; under fake-root fake success on EPERM. */
+     * ownership; under fake-root fake success on EPERM, and on the EACCES of a
+     * file not ours to write once nothing could be lent (dac_faked). */
     case __NR_utimensat: {
         /* A NULL path names the dirfd (futimens). The flags have to be zero
          * for that, and the kernel says so before it looks at the descriptor,
@@ -4220,7 +4891,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                     return -EROFS;
                 long r = reissue(CNG_AT_FDCWD, (long)data, a2, 0, 0, 0,
                                  __NR_utimensat);
-                if (cng_fake_root() && (r == -EPERM || r == -EACCES))
+                if (cng_fake_root() && r == -EPERM)
                     return 0;
                 return r;
             }
@@ -4234,8 +4905,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (ro)
             return ro;
         long r = reissue(a0, (long)p, a2, a3, a4, a5, __NR_utimensat);
-        if (cng_fake_root() && (r == -EPERM || r == -EACCES))
-            return 0;
+        if (cng_fake_root() && r == -EPERM)
+            return 0; /* and EACCES once dac_bypass has had it (dac_faked) */
         return r;
     }
 
@@ -4296,7 +4967,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         if (r == 0 && byfd && a2 && cng_g_l2s)
             cng_l2s_fix_fd(a0, sb);
-        if (r == 0 && cng_g_fake_id && a2)
+        /* A process's /proc entries are its owner's (cng_procfs_owner). */
+        if (r == 0 && cng_g_fake_id && a2 && !cng_procfs_owner(a0, p, sb))
             stat_remap(sb);
         if (r == 0 && bounce && cng_user_copyout((void *)a2, sb, sizeof sb) < 0)
             return -EFAULT;
@@ -4345,7 +5017,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         }
         if (r == 0 && byfd && a4 && cng_g_l2s)
             cng_l2s_fix_fd_statx(a0, sx);
-        if (r == 0 && cng_g_fake_id && a4)
+        if (r == 0 && cng_g_fake_id && a4 && !cng_procfs_owner_statx(a0, p, sx))
             statx_remap(sx);
         if (r == 0 && bounce && cng_user_copyout((void *)a4, sx, sizeof sx) < 0)
             return -EFAULT;
@@ -4421,12 +5093,27 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return xlate_errno(p);
         /* A link2symlink entry presents as a regular file: readlink must fail
          * with EINVAL rather than leak the backing path — including through a
-         * real dirfd, which xlate passes through untranslated. */
+         * real dirfd, which xlate passes through untranslated. A link of
+         * proot's own bookkeeping (an indirection, in plain sight where proot
+         * kept a group beside its first name) is a symlink, and its text is
+         * the HOST path of the file it names: the guest is told its own name
+         * for that file, as proot tells it. */
         if (cng_g_l2s) {
-            char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX];
-            if (cng_resolve_at(a0, gp, 0, hnf, sizeof hnf) == 0 &&
-                cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
-                return -EINVAL;
+            char hnf[CNG_PATH_MAX], data[CNG_PATH_MAX], gv[CNG_PATH_MAX];
+            if (cng_resolve_at(a0, gp, 0, hnf, sizeof hnf) == 0) {
+                if (cng_l2s_resolve(hnf, data, sizeof data, 0) == 1)
+                    return -EINVAL;
+                long n = cng_pin_readlink(hnf, data, sizeof data - 1);
+                if (n > 0 && (data[n] = '\0', data[0] == '/') &&
+                    cng_l2s_untranslate_target(data, gv, sizeof gv)) {
+                    long gl = (long)strlen(gv);
+                    if (gl > bufsiz)
+                        gl = bufsiz;
+                    if (cng_user_copyout((void *)a2, gv, (unsigned long)gl) < 0)
+                        return -EFAULT;
+                    return gl;
+                }
+            }
         }
         /* An fd link reports a HOST path (the kernel names the open file
          * description), and a map_files link the host path of the mapped file.
@@ -4526,7 +5213,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 cng_procfs_fix_fd((int)a0, sb);
             if (cng_g_l2s)
                 cng_l2s_fix_fd(a0, sb);
-            if (cng_g_fake_id)
+            if (cng_g_fake_id && !cng_procfs_owner(a0, "", sb))
                 stat_remap(sb);
             if (cng_user_copyout((void *)a1, sb, sizeof sb) < 0)
                 return -EFAULT;
@@ -4613,14 +5300,22 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * carry their offset in a3 (LP64: the full offset in pos_l; -1 means the
      * current position, which pre_read resolves with an lseek). */
     case __NR_read:
-    case __NR_readv:
-        /* A netlink stand-in is a socketpair end, so the read itself works —
-         * but a request the guest submitted with untrapped write(2) must be
-         * served first or this read blocks on an empty queue (busybox ip under
-         * the -R tier; the seccomp tier never traps read on ordinary fds). */
-        cng_nl_poke((int)a0);
+    case __NR_readv: {
         cng_procfs_pre_read((int)a0, -1);
-        return cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+        long r = cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+        /* A netlink stand-in is a socketpair end, so the read itself works,
+         * and a blocking one waits for the daemon's reply like any other (an
+         * EAGAIN from it is its SO_RCVTIMEO, already waited out). One that
+         * would not wait can be ahead of the daemon, as a receive can
+         * (cng_nl_recv): the daemon is asked to finish, and the read made
+         * once more. The seccomp tier never traps a read on an ordinary fd;
+         * this is the -R tier's, at a site the rewriter patched. */
+        if (r == -EAGAIN &&
+            (sys_fcntl((int)a0, CNG_F_GETFL, 0) & CNG_O_NONBLOCK) &&
+            cng_nl_sync((int)a0))
+            r = cng_syscall6(a0, a1, a2, a3, a4, a5, nr);
+        return r;
+    }
     case __NR_pread64:
     case __NR_preadv:
     case __NR_preadv2:
@@ -4644,8 +5339,18 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * link2symlink names, it is replaced by the rename, so drop its group's
      * refcount (apk installs by renaming a temp file over the final name) —
      * except under RENAME_EXCHANGE, where both names live on. A legacy-format
-     * source (bare-basename target) moving to another directory is repointed
-     * at its (unmoved) data file afterwards. */
+     * name (bare-basename target) moving to another directory is repointed
+     * at its (unmoved) data file afterwards — under EXCHANGE either name can
+     * be one, and both move.
+     *
+     * Two names of one group are two names of one file to the guest, and
+     * the kernel's vfs_rename does nothing for those and answers 0 — the
+     * first thing it asks, after the flags, the lookups, NOREPLACE's EEXIST
+     * and the mount's EROFS, before any permission of the directories. The
+     * host saw two symlinks and moved one over the other: the source name
+     * was gone and the group a link short (`mv a b` of `ln a b`). So such a
+     * pair is answered here, for no flags and for EXCHANGE; any other flag
+     * goes to the host for its own verdict. */
     case __NR_renameat:
     case __NR_renameat2: {
         const char *op = xlate(a0, (const char *)a1, b1, sizeof b1, 0);
@@ -4658,23 +5363,37 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
          * under a :ro bind is EROFS. */
         if (ro_denied(op) || ro_denied(np))
             return -EROFS;
-        int exch = (nr == __NR_renameat2 && ((int)a4 & CNG_RENAME_EXCHANGE));
+        unsigned rfl = nr == __NR_renameat2 ? (unsigned)a4 : 0;
+        int exch = (rfl & CNG_RENAME_EXCHANGE) != 0;
         char data[CNG_PATH_MAX], absdata[CNG_PATH_MAX], dsth[CNG_PATH_MAX];
+        char hnf[CNG_PATH_MAX], sdata[CNG_PATH_MAX];
         unsigned long cnt;
-        int dec = 0, fix = 0;
-        if (cng_g_l2s && !exch && strcmp(op, np) != 0 &&
+        int dec = 0, fix = 0, fix_back = 0;
+        if (cng_g_l2s && strcmp(op, np) != 0 &&
             cng_resolve_at(a2, (const char *)a3, 0, dsth, sizeof dsth) == 0) {
-            if (cng_l2s_resolve(dsth, data, sizeof data, &cnt) == 1)
-                dec = 1;
-            char hnf[CNG_PATH_MAX];
-            if (cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0)
+            int dst_l2s = cng_l2s_resolve(dsth, data, sizeof data, &cnt) == 1;
+            int src_ok =
+                cng_resolve_at(a0, (const char *)a1, 0, hnf, sizeof hnf) == 0;
+            if (dst_l2s && src_ok && !(rfl & ~(unsigned)CNG_RENAME_EXCHANGE) &&
+                cng_l2s_resolve(hnf, sdata, sizeof sdata, 0) == 1 &&
+                strcmp(sdata, data) == 0)
+                return 0;
+            dec = dst_l2s && !exch;
+            if (src_ok)
                 fix = cng_l2s_rename_prep(hnf, absdata, sizeof absdata);
+            /* Under EXCHANGE the destination's name moves to the source's
+             * place as well, and a legacy link of its lands there the same
+             * way (sdata is free: the pair was not one group). */
+            if (src_ok && exch)
+                fix_back = cng_l2s_rename_prep(dsth, sdata, sizeof sdata);
         }
         long r = reissue(a0, (long)op, a2, (long)np, a4, a5, nr);
         if (r == 0 && dec && !cng_fs_host_ro(cng_g_fs, data))
             cng_l2s_decref(data, cnt); /* not on a :ro mount: see unlinkat */
         if (r == 0 && fix)
             cng_l2s_rename_fixup(dsth, absdata);
+        if (r == 0 && fix_back)
+            cng_l2s_rename_fixup(hnf, sdata);
         return r;
     }
 
@@ -4937,19 +5656,38 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_connect:
     case __NR_sendto: {
         /* An emulated netlink socket: bind is a silent success (the guest is
-         * binding a netlink address we do not really have), and a send is the
-         * request whose reply the matching recv will drain. */
-        if (cng_nl_is_fake((int)a0)) {
-            if (nr == __NR_bind || nr == __NR_connect)
-                return 0;
-            long out = 0;
-            if (cng_nl_send((int)a0, (const void *)a1, a2, &out))
-                return out;
-            return 0;
-        }
+         * binding a netlink address we do not really have), and a send goes
+         * into the stand-in pair as the guest made it — the kernel checks the
+         * buffer, and copies the address in as it would for any family before
+         * the sequenced-packet pair ignores it — and is then waited for: the
+         * daemon serves it, and the replies are queued when the call returns,
+         * as the kernel's would be.
+         * MSG_NOSIGNAL: a netlink send never raises SIGPIPE, and a pair whose
+         * daemon has gone would. */
         int is_send = (nr == __NR_sendto);
         long aa = is_send ? a4 : a1;   /* sockaddr */
         long al = is_send ? a5 : a2;   /* addrlen */
+        /* A connect or a send that can block is made from guest context: as
+         * it stands where there is no AF_UNIX path to translate. A bind never
+         * waits, nor a connect of an emulated netlink socket. */
+        int fake = cng_nl_is_fake((int)a0);
+        if (trapped == CNG_DISP_HANDLER &&
+            (is_send || (nr == __NR_connect && !fake))) {
+            int bad, sun = sun_family((const void *)aa, al, &bad);
+            long b = bad ? 0
+                         : sock_bounce(trapped, nr, a0, is_send ? a3 : 0,
+                                       !sun && !fake);
+            if (b)
+                return b;
+        }
+        if (cng_nl_is_fake((int)a0)) {
+            if (nr == __NR_bind || nr == __NR_connect)
+                return 0;
+            long r = reissue(a0, a1, a2, a3 | CNG_MSG_NOSIGNAL, a4, a5, nr);
+            if (r >= 0)
+                cng_nl_sync((int)a0);
+            return r;
+        }
         struct cng_sun_xlate x;
         long r;
         int sx = cng_sun_in(&x, nr == __NR_bind ? (int)a0 : -1,
@@ -4978,17 +5716,41 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         struct cng_msghdr mh;
         if (a1 && cng_user_copyin(&mh, (void *)a1, sizeof mh) < 0)
             return -EFAULT;
+        /* One that can block, from guest context: as it stands with neither
+         * an AF_UNIX name nor control data a fake identity has to rewrite. */
+        if (trapped == CNG_DISP_HANDLER) {
+            int bad = 0, plain = !a1;
+            if (a1)
+                plain = !sun_family(mh.name, (long)mh.namelen, &bad) &&
+                        !ctl_may_carry_creds(&mh);
+            long b = bad ? 0
+                         : sock_bounce(trapped, nr, a0, a2,
+                                       plain && !cng_nl_is_fake((int)a0));
+            if (b)
+                return b;
+        }
         if (cng_nl_is_fake((int)a0)) {
-            /* The payload is the first iovec; netlink requests are single-iov
-             * in every library that builds them. */
-            long out = 0;
-            if (a1 && mh.iov && mh.iovlen > 0) {
-                struct cng_iovec io0;
-                if (cng_user_copyin(&io0, mh.iov, sizeof io0) < 0)
-                    return -EFAULT;
-                cng_nl_send((int)a0, io0.base, (long)io0.len, &out);
+            /* Into the pair as sendto's request goes, every iovec of it one
+             * record, as the kernel's netlink takes the whole message. The
+             * header is our copy without the address the pair would ignore
+             * anyway, or the control data, which the emulation has never read
+             * and which a sequenced-packet pair would judge by AF_UNIX's
+             * rules (SCM_CREDENTIALS against the real ids, under a fake
+             * one) rather than netlink's. */
+            long r;
+            if (!a1) {
+                r = reissue(a0, a1, a2 | CNG_MSG_NOSIGNAL, a3, a4, a5, nr);
+            } else {
+                mh.name = 0;
+                mh.namelen = 0;
+                mh.control = 0;
+                mh.controllen = 0;
+                r = reissue(a0, (long)&mh, a2 | CNG_MSG_NOSIGNAL, a3, a4, a5,
+                            nr);
             }
-            return out;
+            if (r >= 0)
+                cng_nl_sync((int)a0);
+            return r;
         }
         struct cng_sun_xlate x;
         long r;
@@ -4999,12 +5761,15 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         if (sx > 0) {
             mh.name = x.buf;
             mh.namelen = (unsigned)x.len;
-            r = reissue(a0, (long)&mh, a2, a3, a4, a5, nr);
-        } else if (sx < 0) {
-            r = sx;
-        } else {
-            r = reissue(a0, a1, a2, a3, a4, a5, nr);
         }
+        if (sx < 0)
+            r = sx;
+        else if (a1 && ctl_may_carry_creds(&mh))
+            r = sendmsg_creds(a0, &mh, a2); /* the fake ids a claim names */
+        else if (sx > 0)
+            r = reissue(a0, (long)&mh, a2, a3, a4, a5, nr);
+        else
+            r = reissue(a0, a1, a2, a3, a4, a5, nr);
         cng_sun_done(&x, r);
         return r;
     }
@@ -5012,34 +5777,52 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     /* sendmmsg: sendmsg's array form, and one msg_name per message is the whole
      * of what it adds. The call exists to spend one syscall on a batch — UDP is
      * what it is for — so a batch carrying no AF_UNIX address is re-issued
-     * whole and costs a scan. Only when a message really does carry one is the
+     * whole and costs a scan. Only when a message really does carry one (or,
+     * under a fake identity, control data with room for a credentials record
+     * on AF_UNIX or AF_NETLINK, the families whose sendmsg judges one: see
+     * sendmsg_creds) is the
      * array taken apart into per-message sendmsg calls, which is what the
      * kernel's own loop does anyway: send until one fails, write each msg_len
      * back as it goes, report the count if any went out and the error only if
      * none did. The guest's array is never rewritten — each translated header is
      * a copy, exactly as in sendmsg above.
      *
-     * (An emulated netlink socket needs nothing here: a native sendmmsg puts the
-     * request datagrams into the stand-in socketpair, which is the same route an
-     * untrapped write(2) takes, and the matching receive serves them.) */
+     * An emulated netlink socket is re-issued whole as well: the batch goes
+     * into the stand-in pair, whose sequenced-packet end ignores the addresses
+     * naming the kernel, the daemon serves each request the way it serves one
+     * sent with write(2), and the call then waits for it to have done so, as
+     * a send does (see sendto). */
     case __NR_sendmmsg: {
         struct cng_mmsghdr *v = (struct cng_mmsghdr *)a1;
         unsigned long vlen = (unsigned)a2;
         if (vlen > CNG_UIO_MAXIOV) /* as the kernel clamps it */
             vlen = CNG_UIO_MAXIOV;
-        if (!v || !vlen)
-            return reissue(a0, a1, a2, a3, a4, a5, nr);
-        /* A socket that is not AF_UNIX cannot carry a sun_path at all, and a UDP
-         * batch is what this call exists for — so ask the socket once instead of
-         * reading up to 1024 addresses out of guest memory to find that out.
-         * (Each of those reads has to be probed first, since a fault in the
-         * handler is unblockable, and a probe is itself a syscall: the whole
-         * point of sendmmsg is not to spend one per message.) */
+        /* One that can block, from guest context: as it stands for a family
+         * with no address of the kind translated, as below. */
         int dom = 0;
         unsigned dlen = sizeof dom;
-        if (CNG_SYS(__NR_getsockopt, a0, CNG_SOL_SOCKET, CNG_SO_DOMAIN, &dom,
-                    &dlen, 0) == 0 &&
-            dom != CNG_AF_UNIX)
+        int plain = !v || !vlen ||
+                    (CNG_SYS(__NR_getsockopt, a0, CNG_SOL_SOCKET, CNG_SO_DOMAIN,
+                             &dom, &dlen, 0) == 0 &&
+                     dom != CNG_AF_UNIX &&
+                     !(cng_g_fake_id && dom == CNG_AF_NETLINK));
+        long b = sock_bounce(trapped, nr, a0, a3,
+                             plain && !cng_nl_is_fake((int)a0));
+        if (b)
+            return b;
+        if (cng_nl_is_fake((int)a0)) {
+            long r = reissue(a0, a1, a2, a3 | CNG_MSG_NOSIGNAL, a4, a5, nr);
+            if (r > 0)
+                cng_nl_sync((int)a0);
+            return r;
+        }
+        /* A socket that is not AF_UNIX cannot carry a sun_path at all, and a UDP
+         * batch is what this call exists for — so the socket was asked once
+         * instead of reading up to 1024 addresses out of guest memory to find
+         * that out. (Each of those reads has to be probed first, since a fault
+         * in the handler is unblockable, and a probe is itself a syscall: the
+         * whole point of sendmmsg is not to spend one per message.) */
+        if (plain)
             return reissue(a0, a1, a2, a3, a4, a5, nr);
         /* A window of the array at a time (mmsg_take), so the scan costs a
          * syscall per MMSG_WIN messages rather than one per message — and every
@@ -5050,7 +5833,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             unsigned long k = vlen - i < MMSG_WIN ? vlen - i : MMSG_WIN;
             unsigned long got = mmsg_take(win, v + i, k);
             for (unsigned long j = 0; j < got; j++)
-                if (cng_sun_needed(win[j].hdr.name, (long)win[j].hdr.namelen)) {
+                if (cng_sun_needed(win[j].hdr.name, (long)win[j].hdr.namelen) ||
+                    ctl_may_carry_creds(&win[j].hdr)) {
                     any = 1;
                     break;
                 }
@@ -5077,6 +5861,8 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
                 }
                 if (sx < 0)
                     r = sx;
+                else if (ctl_may_carry_creds(&mh))
+                    r = sendmsg_creds(a0, &mh, a3);
                 else
                     r = reissue(a0, (long)&mh, a3, 0, 0, 0, __NR_sendmsg);
                 cng_sun_done(&x, r);
@@ -5116,6 +5902,16 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         int is_recv = (nr == __NR_recvfrom);
         long aa = is_recv ? a4 : a1;
         long alp = is_recv ? a5 : a2;
+        /* An accept or a receive that can block, from guest context: as it
+         * stands when no address is wanted back. The name queries never wait;
+         * nor does an accept of an emulated netlink socket (EOPNOTSUPP). */
+        if (is_recv || ((nr == __NR_accept || nr == __NR_accept4) &&
+                        !cng_nl_is_fake((int)a0))) {
+            long b = sock_bounce(trapped, nr, a0, is_recv ? a3 : 0,
+                                 (!aa || !alp) && !cng_nl_is_fake((int)a0));
+            if (b)
+                return b;
+        }
         if (cng_nl_is_fake((int)a0)) {
             if (is_recv) {
                 /* The source address is handed back only for a receive that
@@ -5165,23 +5961,29 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     }
 
     case __NR_recvmsg: {
-        if (cng_nl_is_fake((int)a0)) {
+        int fake = cng_nl_is_fake((int)a0);
+        /* msg_name is an output buffer of the guest's, so it gets the same
+         * bounce the single-address calls get, and the control data one of
+         * its own where descriptors could arrive in it (recvmsg_bounced). A
+         * header asking for neither is the kernel's to fill as it stands —
+         * and one that can block is made from guest context, as it stands or
+         * not (see sock_bounce). */
+        struct cng_msghdr *g = (struct cng_msghdr *)a1;
+        struct cng_msghdr snap; /* our copy of the guest's header, taken once */
+        int bad = !a1 || cng_user_copyin(&snap, g, sizeof snap) < 0;
+        int bname = !bad && snap.name && snap.namelen;
+        int bctl = !bad && ctl_may_carry_fds(&snap);
+        long b = sock_bounce(trapped, nr, a0, a2,
+                             !fake && (bad || (!bname && !bctl)));
+        if (b)
+            return b;
+        if (fake) {
             struct cng_msghdr h;
             if (cng_user_copyin(&h, (void *)a1, sizeof h) < 0)
                 return -EFAULT; /* a NULL header too, as the kernel says */
             return nl_recvmsg(a0, (struct cng_msghdr *)a1, &h, a2);
         }
-        /* msg_name is an output buffer of the guest's, so it gets the same
-         * bounce the single-address calls get, and the control data one of
-         * its own where descriptors could arrive in it (recvmsg_bounced). A
-         * header asking for neither is the kernel's to fill as it stands. */
-        struct cng_msghdr *g = (struct cng_msghdr *)a1;
-        struct cng_msghdr snap; /* our copy of the guest's header, taken once */
-        if (!a1 || cng_user_copyin(&snap, g, sizeof snap) < 0)
-            return reissue(a0, a1, a2, a3, a4, a5, nr);
-        int bname = snap.name && snap.namelen;
-        int bctl = ctl_may_carry_fds(&snap);
-        if (!bname && !bctl)
+        if (bad || (!bname && !bctl))
             return reissue(a0, a1, a2, a3, a4, a5, nr);
         return recvmsg_bounced(a0, g, &snap, a2, bname, bctl, 0);
     }
@@ -5197,6 +5999,21 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
         unsigned long vlen = (unsigned)a2;
         if (vlen > CNG_UIO_MAXIOV)
             vlen = CNG_UIO_MAXIOV;
+        /* One that can block, from guest context (see sock_bounce): as it
+         * stands for the families re-issued whole below. */
+        if (trapped == CNG_DISP_HANDLER) {
+            int dom = 0;
+            unsigned dlen = sizeof dom;
+            int plain = !cng_nl_is_fake((int)a0) &&
+                        (!v || !vlen ||
+                         (CNG_SYS(__NR_getsockopt, a0, CNG_SOL_SOCKET,
+                                  CNG_SO_DOMAIN, &dom, &dlen, 0) == 0 &&
+                          dom != CNG_AF_UNIX &&
+                          !(cng_g_fake_id && dom == CNG_AF_NETLINK)));
+            long b = sock_bounce(trapped, nr, a0, a3, plain);
+            if (b)
+                return b;
+        }
 
         /* An emulated netlink socket has to be taken apart per message instead,
          * each received as recvmsg receives one (nl_recvmsg): its replies are
@@ -5250,13 +6067,15 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 
         /* One question to the socket instead of a scan of the array: a family
          * other than AF_UNIX has no sun_path to map back, and a UDP batch is
-         * what this call exists for. (The same shortcut sendmmsg takes.) */
+         * what this call exists for — nor, but for AF_NETLINK under a fake
+         * identity, a credentials record to remap (recvmsg_bounced). (The same
+         * shortcut sendmmsg takes.) */
         int dom = 0;
         unsigned dlen = sizeof dom;
         if (!v || !vlen ||
             (CNG_SYS(__NR_getsockopt, a0, CNG_SOL_SOCKET, CNG_SO_DOMAIN, &dom,
                      &dlen, 0) == 0 &&
-             dom != CNG_AF_UNIX))
+             dom != CNG_AF_UNIX && !(cng_g_fake_id && dom == CNG_AF_NETLINK)))
             return reissue(a0, a1, a2, a3, a4, a5, nr);
 
         /* Per message from here. A loop of recvmsg calls has no timeout to give,
@@ -5311,10 +6130,11 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
 
     /* getsockopt(SOL_SOCKET, SO_PEERCRED): the kernel reports the real invoking
      * uid/gid for the peer, but a guest daemon compares it against its own
-     * getuid(), which under --fake-id is the fake identity. Remap the pair
-     * through the same rule stat uses. The pid is deliberately left alone: guest
-     * pid == host pid here, so it is already correct. Trapped only under
-     * --fake-id.
+     * getuid(), which under --fake-id is the fake identity. The pair is the
+     * one the peer goes by (peer_ids): a session bus that `su - user` started
+     * must find its client to be that user, not the root the run began as.
+     * The pid is deliberately left alone: guest pid == host pid here, so it is
+     * already correct. Trapped only under --fake-id.
      *
      * The kernel fills a ucred of ours and the guest gets the remapped one in
      * one copy. It used to fill the guest's own buffer and be corrected there
@@ -5324,8 +6144,12 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
      * the meantime chose what was remapped. The length word is ours as well,
      * taken from the guest before the call as sock_getsockopt takes it: a
      * negative one is its EINVAL, a short one gets that many bytes of the
-     * struct, and what was written is reported back, in that order. */
+     * struct, and what was written is reported back, in that order.
+     * SO_PEERGROUPS, from the same struct cred, is peer_groups'. */
     case __NR_getsockopt: {
+        if (cng_g_fake_id && a1 == CNG_SOL_SOCKET && a2 == CNG_SO_PEERGROUPS &&
+            a4)
+            return peer_groups(a0, a3, a4);
         if (!(cng_g_fake_id && a1 == CNG_SOL_SOCKET && a2 == CNG_SO_PEERCRED &&
               a3 && a4))
             return reissue(a0, a1, a2, a3, a4, a5, nr);
@@ -5339,8 +6163,7 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
             return r;
         if (got < 0 || (unsigned)got > sizeof uc)
             got = sizeof uc; /* not a length the kernel reports; bounded anyway */
-        uc[1] = cng_remap_uid(uc[1]);
-        uc[2] = cng_remap_gid(uc[2]);
+        peer_ids(uc, (unsigned long)got, 0);
         if ((got && cng_user_copyout((void *)a3, uc, (unsigned long)got) < 0) ||
             cng_user_copyout((void *)a4, &got, sizeof got) < 0)
             return -EFAULT;
@@ -5622,29 +6445,58 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_ptrace:
         return cng_pt_syscall(a0, a1, (u64)a2, (u64)a3);
 
+    /* The waits are trapped only on a tracer, but every -R site reaches the
+     * dispatcher, so there the guest's own wait is made by the kernel unless
+     * this process could be owed an emulated stop (cng_pt_wait_native). That
+     * wait needs the guest's own mask, which the SIGSYS handler does not run
+     * on. There a wait polls the registry instead, and ends for a ptrace kick
+     * with CNG_ERESTART (see cng_sig_kick_pending). */
     case __NR_wait4:
-        return cng_pt_wait4(a0, (u64)a1, a2, (u64)a3, cng_pt_cur_uc());
-
-    case __NR_waitid:
+    case __NR_waitid: {
+        long w;
+        if ((trapped == CNG_DISP_TRAMP || trapped == CNG_DISP_BOUNCED) &&
+            cng_pt_wait_native(nr, a0, a1, a2, a3, a4, &w))
+            return w;
+        if (nr == __NR_wait4)
+            return cng_pt_wait4(a0, (u64)a1, a2, (u64)a3, cng_pt_cur_uc());
         return cng_pt_waitid(a0, a1, (u64)a2, a3, (u64)a4, cng_pt_cur_uc());
+    }
 
     /* A stop signal aimed at a tracee becomes a cooperative group-stop: a real
      * SIGSTOP would freeze it inside its ptrace service loop, and every later
      * tracer request would deadlock (strace sends exactly that on ^C). SIGCONT
      * ends a PTRACE_LISTEN group-stop the same way. Everything else, and every
-     * target that is not a tracee, is sent for real. */
+     * target that is not a tracee, is sent for real.
+     *
+     * The family is also trapped for every guest while there is a view (with
+     * a registry: sig_view), because a signal names a process by pid and /proc
+     * hides host processes by path only — a guest killed a process its /proc
+     * said did not exist, and kill(-1) reached every process of the user. A
+     * hidden target is ESRCH (sig_target), and the group and broadcast forms
+     * reach the processes the view shows (kill_some). The thread-directed
+     * calls are judged by the thread group they name: the kernel delivers only
+     * to a task of that group, so a guest's own (raise, pthread_kill) needs no
+     * lookup. rt_sigqueueinfo has no group form — the kernel answers ESRCH for
+     * a pid of zero or below — and pidfd_send_signal needs a pidfd, which
+     * pidfd_open hands out only for a process the view shows. */
     case __NR_kill:
         if (cng_pt_signal_route(a0, (int)a1))
             return 0;
-        return reissue(a0, a1, a2, a3, a4, a5, nr);
+        /* INT_MIN negates to no group; the kernel answers it with ESRCH. */
+        if (sig_view() && (int)a0 <= 0 && (int)a0 != -0x7fffffff - 1)
+            return kill_some((int)a0, (int)a1);
+        return reissue(sig_target(a0), a1, a2, a3, a4, a5, nr);
     case __NR_tkill:
         if (cng_pt_signal_route(a0, (int)a1))
             return 0;
-        return reissue(a0, a1, a2, a3, a4, a5, nr);
+        return reissue(sig_target(a0), a1, a2, a3, a4, a5, nr);
     case __NR_tgkill:
         if (cng_pt_signal_route(a1, (int)a2))
             return 0;
-        return reissue(a0, a1, a2, a3, a4, a5, nr);
+        return reissue(sig_target(a0), a1, a2, a3, a4, a5, nr);
+    case __NR_rt_sigqueueinfo:
+    case __NR_rt_tgsigqueueinfo:
+        return reissue(sig_target(a0), a1, a2, a3, a4, a5, nr);
 
     /* strace reads tracee memory with these before falling back to PEEKDATA.
      * When the peer is one of our stopped tracees they are served from the
@@ -5975,12 +6827,28 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     case __NR_mprotect:
         return reissue(a0, a1, a2, a3, a4, a5, nr);
 
+    /* mremap with MREMAP_DONTUNMAP, which leaves the old range mapped — and
+     * reading what backs it: a file's bytes, or zero-fill. The loader's images
+     * are anonymous copies standing in for file mappings, so a move out of one
+     * is made as a file mapping's would be (execmap.c). The filter traps only
+     * the flag; under -R every mremap comes here and the rest go straight back
+     * out. */
+    case __NR_mremap:
+        if (!((unsigned long)a3 & CNG_MREMAP_DONTUNMAP) ||
+            !cng_execmap_copied((unsigned long)a0, (unsigned long)a1))
+            return reissue(a0, a1, a2, a3, a4, a5, nr);
+        return cng_execmap_dontunmap((unsigned long)a0, (unsigned long)a1,
+                                     (unsigned long)a2, a3, (unsigned long)a4);
+
     /* --- credential syscalls (trapped only when --fake-id is active) ---
      * All get/set uid/gid family, groups, and capability calls are emulated
      * against the synthetic credential set in cred.c, which enforces real POSIX
      * privilege rules. These never re-issue under --fake-id: the setters sit on
      * Android's seccomp block-list, and a re-issue from inside this (SIGSYS)
-     * handler force-kills the process (masked nested seccomp SIGSYS). */
+     * handler force-kills the process (masked nested seccomp SIGSYS). Without
+     * it they arrive from -R, a tracee, or that block-list's own trap, and are
+     * re-issued unless the probe found them refused — then cred.c answers from
+     * the real ids what the kernel would. */
     case __NR_getuid:
     case __NR_geteuid:
     case __NR_getgid:
@@ -6024,6 +6892,336 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
     }
 }
 
+/* --- fake root's DAC bypass, lent -----------------------------------------
+ *
+ * Root is not held back by permission bits. CAP_DAC_OVERRIDE lets it create and
+ * remove names in a directory whose mode forbids writing it, and open a file
+ * for an access its mode refuses. CAP_DAC_READ_SEARCH lets it search a
+ * directory that has no x bit. A fake root is the real uid underneath and has
+ * none of that. So under -u, tar could not fill a directory it had just made
+ * 0500. GNU tar as root creates a directory with the owner bits it will end up
+ * with, counting on exactly this; only a non-root user's directories start
+ * out writable. `rm -rf` could not empty such a directory either, and a 0400
+ * file could not be appended to.
+ *
+ * No syscall gives an unprivileged process that override. But every inode in
+ * the guest's own tree belongs to the real uid, and an owner may change its
+ * mode. So when the host refuses a path call with EACCES under fake root, the
+ * first inode on the call's way that the real uid owns and whose owner bits
+ * fall short of what the call needs (cng_pin_dac_find) is lent those bits.
+ * The call is then made again and the mode put back. That goes one inode at a
+ * time, since the next one short of its bits may only be reachable once the
+ * first is searchable. proot's fake root lends eagerly, to every directory of
+ * every path. This only ever touches an inode the host has just refused, so a
+ * call the host allows costs nothing.
+ *
+ * The call is made again whole — the walk, the l2s probes, the re-issue — and
+ * not only its last syscall. A walk through a directory it may not search reads
+ * every name past it as a plain one, so a symlink there was never followed.
+ * Only a second walk, with the search bit lent, finds it.
+ *
+ * Lends take turns across the session, under an flock on the rootfs
+ * directory. A process whose call was refused while another had the same
+ * directory lent saw the lent mode, found nothing short, and kept its EACCES;
+ * and one whose lend was restored by the other in the middle of its retry was
+ * refused again. Four processes creating 25 files each in one 0500 directory
+ * lost a third of them. Under the lock every mode read is the real one.
+ *
+ * What it cannot do: lend anything on an inode that belongs to someone else (a
+ * host directory bound in, the host's /proc and /dev). There the refusal stands
+ * as the real uid's. And the lent mode is a real mode for as long as the call
+ * takes: a process outside the session can see it in that window, and a
+ * SIGKILL in it leaves the mode lent. The restore gives way to a mode someone
+ * else set meanwhile, so a concurrent chmod is never undone. */
+
+/* One name a refused call carries, and what root's bypass would have let it
+ * have on the way there. */
+struct dac_arg {
+    long dirfd;
+    const char *path;
+    int deref; /* the last component is followed */
+    struct cng_dac_need need;
+};
+
+#define DAC_ENTRY 0300u /* a name made or removed: write and search */
+#define DAC_LENDS 16    /* inodes lent for one call, at most */
+
+/* The names `nr` carries in a[], and what each needs. 0 for a call this does
+ * not retry: one with no name, and execve, which does not come back when it
+ * succeeds — nothing lent for it could ever be given back. */
+static int dac_args(long nr, const long *a, struct dac_arg *v) {
+    memset(v, 0, 2 * sizeof *v);
+    v[0].dirfd = v[1].dirfd = CNG_AT_FDCWD;
+    v[0].path = (const char *)a[1];
+    switch (nr) {
+    case __NR_openat:
+    case __NR_openat2: {
+        long fl = a[2];
+        if (nr == __NR_openat2) {
+            struct cng_open_how how;
+            if (read_open_how(a[2], (unsigned long)a[3], &how))
+                return 0;
+            fl = (long)how.flags;
+        }
+        v[0].dirfd = a[0];
+        /* O_CREAT|O_EXCL does not follow a final link either: the name has
+         * to be new. */
+        v[0].deref = !(fl & CNG_O_NOFOLLOW) &&
+                     (fl & (CNG_O_CREAT | CNG_O_EXCL)) !=
+                         (CNG_O_CREAT | CNG_O_EXCL);
+        if ((fl & CNG_O_TMPFILE) == CNG_O_TMPFILE) {
+            /* The name is the directory the unnamed file is made in. */
+            v[0].need.leaf = DAC_ENTRY;
+            v[0].need.leaf_dir = 1;
+        } else if (!(fl & CNG_O_PATH)) {
+            int acc = (int)fl & 3;
+            v[0].need.leaf = acc == CNG_O_RDONLY   ? 0400u
+                             : acc == CNG_O_WRONLY ? 0200u
+                                                   : 0600u;
+            if (fl & CNG_O_TRUNC)
+                v[0].need.leaf |= 0200u;
+            if (fl & CNG_O_CREAT)
+                v[0].need.parent_new = DAC_ENTRY;
+        }
+        return 1;
+    }
+    case __NR_mkdirat:
+    case __NR_mknodat:
+    case __NR_unlinkat:
+        v[0].dirfd = a[0];
+        v[0].need.parent = v[0].need.parent_new = DAC_ENTRY;
+        return 1;
+    case __NR_symlinkat:
+        v[0].dirfd = a[1];
+        v[0].path = (const char *)a[2];
+        v[0].need.parent = v[0].need.parent_new = DAC_ENTRY;
+        return 1;
+    case __NR_renameat:
+    case __NR_renameat2:
+        /* A directory moved to another parent has its ".." rewritten, which
+         * takes write on the directory itself — and under RENAME_EXCHANGE on
+         * the one moving the other way too. Asked last, so a rename within
+         * one directory never gets that far. */
+        v[0].dirfd = a[0];
+        v[0].need.parent = v[0].need.parent_new = DAC_ENTRY;
+        v[0].need.leaf = 0200u;
+        v[0].need.leaf_dir = 1;
+        v[1].dirfd = a[2];
+        v[1].path = (const char *)a[3];
+        v[1].need.parent = v[1].need.parent_new = DAC_ENTRY;
+        if (nr == __NR_renameat2 && ((unsigned)a[4] & CNG_RENAME_EXCHANGE)) {
+            v[1].need.leaf = 0200u;
+            v[1].need.leaf_dir = 1;
+        }
+        return 2;
+    case __NR_linkat:
+        /* The source is only looked up — except under -l, whose first link
+         * of a file moves it into the store and leaves a symlink in its
+         * place, which writes the source's directory. A source named by its
+         * descriptor (an empty name) is not looked up at all. */
+        v[0].dirfd = a[0];
+        v[0].deref = ((int)a[4] & CNG_AT_SYMLINK_FOLLOW) != 0;
+        if (cng_g_l2s)
+            v[0].need.parent = DAC_ENTRY;
+        v[1].dirfd = a[2];
+        v[1].path = (const char *)a[3];
+        v[1].need.parent = v[1].need.parent_new = DAC_ENTRY;
+        return 2;
+    case __NR_truncate:
+        v[0].path = (const char *)a[0];
+        v[0].deref = 1;
+        v[0].need.leaf = 0200u;
+        return 1;
+    case __NR_chdir:
+    case __NR_chroot:
+        v[0].path = (const char *)a[0];
+        v[0].deref = 1;
+        v[0].need.leaf = 0100u;
+        v[0].need.leaf_dir = 1;
+        return 1;
+
+    /* The rest only look their name up: search on the way is all they need
+     * of a mode. Followed or not as the call says, since what is followed
+     * decides which directories the way runs through. */
+    case __NR_newfstatat:
+    case __NR_faccessat2:
+    case __NR_fchmodat2:
+    case __NR_utimensat:
+        v[0].dirfd = a[0];
+        v[0].deref = !((int)a[3] & CNG_AT_SYMLINK_NOFOLLOW);
+        return 1;
+    case __NR_statx:
+    case __NR_setxattrat:
+    case __NR_getxattrat:
+    case __NR_listxattrat:
+    case __NR_removexattrat:
+        v[0].dirfd = a[0];
+        v[0].deref = !((int)a[2] & CNG_AT_SYMLINK_NOFOLLOW);
+        return 1;
+    case __NR_fchownat:
+    case __NR_file_getattr:
+    case __NR_file_setattr:
+        v[0].dirfd = a[0];
+        v[0].deref = !((int)a[4] & CNG_AT_SYMLINK_NOFOLLOW);
+        return 1;
+    case __NR_faccessat:
+    case __NR_fchmodat:
+        v[0].dirfd = a[0];
+        v[0].deref = 1;
+        return 1;
+    case __NR_readlinkat:
+        v[0].dirfd = a[0];
+        return 1;
+    case __NR_name_to_handle_at:
+        v[0].dirfd = a[0];
+        v[0].deref = ((int)a[4] & CNG_AT_SYMLINK_FOLLOW) != 0;
+        return 1;
+    case __NR_inotify_add_watch:
+        v[0].deref = !((unsigned)a[2] & CNG_IN_DONT_FOLLOW);
+        return 1;
+    case __NR_statfs:
+    case __NR_getxattr:
+    case __NR_listxattr:
+    case __NR_setxattr:
+    case __NR_removexattr:
+        v[0].path = (const char *)a[0];
+        v[0].deref = 1;
+        return 1;
+    case __NR_lgetxattr:
+    case __NR_llistxattr:
+    case __NR_lsetxattr:
+    case __NR_lremovexattr:
+        v[0].path = (const char *)a[0];
+        return 1;
+    }
+    return 0;
+}
+
+/* The calls fake root has always answered success when the host refused them
+ * — the ownership and mode changes and the times, which root may make on any
+ * file (chattr_result). An EACCES among those is a search the way refused, so
+ * it is lent first like any other, and the change happens for real wherever
+ * the inodes are ours. Only what is left is faked as before. */
+static int dac_faked(long nr) {
+    return nr == __NR_fchmodat || nr == __NR_fchmodat2 ||
+           nr == __NR_fchownat || nr == __NR_fchown || nr == __NR_fchmod ||
+           nr == __NR_utimensat;
+}
+
+/* The next inode to lend for the call in a[]: an O_PATH descriptor on it, with
+ * its mode and the mode to lend it, or -1 for none. Its own frame, so the
+ * buffer below is gone again before the call is made once more. */
+__attribute__((noinline)) static int dac_next(long nr, const long *a,
+                                              unsigned *orig, unsigned *lent) {
+    struct dac_arg v[2];
+    int n = dac_args(nr, a, v);
+    for (int i = 0; i < n; i++) {
+        if (!v[i].path || !v[i].path[0])
+            continue;
+        char buf[CNG_PATH_MAX];
+        const char *p =
+            xlate(v[i].dirfd, v[i].path, buf, sizeof buf, v[i].deref);
+        if (xlate_bad(p))
+            continue;
+        unsigned mode, lack;
+        int fd = cng_pin_dac_find((int)v[i].dirfd, p, &v[i].need, &mode, &lack);
+        if (fd < 0)
+            continue;
+        *orig = mode;
+        *lent = mode | lack;
+        if (cng_g_debug)
+            cng_dprintf(2, "[cng] fake-root lend nr=%ld %s: %o -> %o\n", nr, p,
+                        mode, mode | lack);
+        return fd;
+    }
+    return -1;
+}
+
+/* A refused call made again with root's bypass lent, inode by inode, until
+ * the host answers anything but EACCES or nothing is left to lend. */
+__attribute__((noinline)) static long dac_bypass(long nr, long a0, long a1,
+                                                 long a2, long a3, long a4,
+                                                 long a5, int trapped) {
+    long a[6] = {a0, a1, a2, a3, a4, a5};
+    long r = -EACCES;
+    struct dac_arg v[2];
+    if (!dac_args(nr, a, v))
+        goto out;
+    /* The names, copied in once: what is lent and what is then made has to
+     * be the same name, whatever another thread writes into the guest's
+     * buffer meanwhile. Put back where the guest's pointers were, as the
+     * dispatcher does with its own copies. */
+    struct path_args pa;
+    path_args_of(nr, a0, a1, a2, a3, &pa);
+    char pb1[CNG_PATH_MAX], pb2[CNG_PATH_MAX];
+    if ((pa.p1 && cng_user_strcopyin(pb1, pa.p1, sizeof pb1) < 0) ||
+        (pa.p2 && cng_user_strcopyin(pb2, pa.p2, sizeof pb2) < 0))
+        goto out;
+    if (pa.p1)
+        a[pa.i1] = (long)pb1;
+    if (pa.p2)
+        a[pa.i2] = (long)pb2;
+    /* Every signal but SIGSYS held from the lock to the unlock — which is the
+     * mask the SIGSYS tier runs all of this under anyway. On the -R tier a
+     * handler of the guest's would otherwise run inside the window, and one
+     * that longjmp'd out of it left the mode lent for good. */
+    unsigned long hold = ~0UL & ~(1UL << (CNG_SIGSYS - 1)), mask = 0;
+    CNG_SYS(__NR_rt_sigprocmask, 0 /*SIG_BLOCK*/, &hold, &mask, 8, 0, 0);
+    /* The turn (see above). Where none can be had the lend goes ahead
+     * unlocked: a refusal that might have been answered is not given up for
+     * a lock. Given back with LOCK_UN before the close, as l2s_lock gives its
+     * own back, so a duplicate a fork on another thread made meanwhile does
+     * not hold it on. */
+    char root[CNG_PATH_MAX];
+    long lk = -1;
+    if (cng_fs_rootfs(root, sizeof root) < sizeof root)
+        lk = sys_openat(CNG_AT_FDCWD, root[0] ? root : "/",
+                        CNG_O_RDONLY | CNG_O_DIRECTORY | CNG_O_CLOEXEC, 0);
+    if (lk >= 0)
+        while (CNG_SYS(__NR_flock, (int)lk, 2 /* LOCK_EX */, 0, 0, 0, 0) ==
+               -EINTR)
+            ;
+    struct {
+        int fd;
+        unsigned orig, lent;
+    } led[DAC_LENDS];
+    int nl = 0;
+    while (nl < DAC_LENDS) {
+        unsigned orig, lent;
+        int fd = dac_next(nr, a, &orig, &lent);
+        if (fd < 0 || cng_pin_dac_lend(fd, lent) != 0)
+            break;
+        led[nl].fd = fd;
+        led[nl].orig = orig;
+        led[nl].lent = lent;
+        nl++;
+        r = dispatch_1(nr, a[0], a[1], a[2], a[3], a[4], a[5], trapped);
+        if (r != -EACCES)
+            break;
+    }
+    while (nl > 0) {
+        nl--;
+        cng_pin_dac_restore(led[nl].fd, led[nl].orig, led[nl].lent);
+    }
+    if (lk >= 0) {
+        CNG_SYS(__NR_flock, (int)lk, 8 /* LOCK_UN */, 0, 0, 0, 0);
+        sys_close((int)lk);
+    }
+    CNG_SYS(__NR_rt_sigprocmask, 2 /*SIG_SETMASK*/, &mask, 0, 8, 0, 0);
+out:
+    if (r == -EACCES && dac_faked(nr))
+        return 0;
+    return r;
+}
+
+long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
+                  int trapped) {
+    long r = dispatch_1(nr, a0, a1, a2, a3, a4, a5, trapped);
+    if (r == -EACCES && cng_fake_root())
+        r = dac_bypass(nr, a0, a1, a2, a3, a4, a5, trapped);
+    return r;
+}
+
 /* The -R trampoline's entry point: one rewritten `svc` site, with a full
  * register frame the trampoline built on its own stack (see tramp.S).
  *
@@ -6033,48 +7231,120 @@ long cng_dispatch(long nr, long a0, long a1, long a2, long a3, long a4, long a5,
  * read and write, and the same single-step report. `trapped` is 0 here — an
  * unhandled syscall on this path is an ordinary one to re-issue, not one
  * Android blocked. */
+/* The same entry serves a trap the SIGSYS handler sent back out to be
+ * dispatched from guest context (cng_dispatch_bounced): what differs is that
+ * the handler already reported the entry stop. */
+struct tramp_call {
+    struct cng_gframe f; /* f.r: the guest's registers */
+    long nr;
+    int mode;            /* CNG_DISP_TRAMP or CNG_DISP_BOUNCED */
+    int owed;            /* bounced: the handler reported the entry stop */
+};
+
 /* The trapped syscall itself, the -R counterpart of sigsys_syscall: the one
  * case that needs the register frame rather than six arguments (the converted
  * clone puts the child's stack into it, for the trampoline's exit to install),
- * then the dispatcher for everything else. */
-static void tramp_syscall(struct cng_uregs *r, long nr) {
+ * then the dispatcher for everything else. A tracer that changed the registers
+ * at a stop taken inside the call abandoned it (pt_inflight_stop in ptrace.c):
+ * its result is then dropped, and the registers are the tracer's. */
+static void tramp_syscall(struct tramp_call *c, long nr) {
+    struct cng_uregs *r = c->f.r;
     if (nr == __NR_clone) {
         cng_clone_convert(r);
-        return;
+    } else {
+        long res = cng_dispatch(nr, (long)r->x[0], (long)r->x[1], (long)r->x[2],
+                                (long)r->x[3], (long)r->x[4], (long)r->x[5],
+                                c->mode);
+        if (!c->f.abandon)
+            r->x[0] = (u64)res;
     }
-    r->x[0] = (u64)cng_dispatch(nr, (long)r->x[0], (long)r->x[1], (long)r->x[2],
-                                (long)r->x[3], (long)r->x[4], (long)r->x[5], 0);
+    c->f.done = 1;
 }
 
 static void tramp_body(void *p) {
-    struct cng_uregs *r = (struct cng_uregs *)p;
-    long nr = (long)r->x[8];
+    struct tramp_call *c = (struct tramp_call *)p;
+    struct cng_uregs *r = c->f.r;
+    long nr = c->nr;
+    u64 after = r->pc; /* the instruction after the guest's svc */
+    int entered = c->mode == CNG_DISP_BOUNCED;
     /* An untraced exit does not come back, so the slot it holds would stay
      * claimed and busy — and a thread that later inherits the tid would find it
      * so and run in place. Give it back while still on it: nothing nests below
      * an exit. Traced is left alone, since there a tracer can cancel the call
      * and make it return after all. */
-    if ((nr == __NR_exit || nr == __NR_exit_group) && !cng_pt_active())
+    if (!entered && (nr == __NR_exit || nr == __NR_exit_group) &&
+        !cng_pt_active())
         cng_scratch_leave();
     cng_pt_set_frame(r, 0);
-    if (!cng_pt_active()) {
-        tramp_syscall(r, nr);
-        return;
+    for (;;) {
+        if (!entered && cng_pt_active()) {
+            if (!cng_pt_syscall_entry(r, &nr)) {
+                cng_pt_syscall_exit(r); /* cancelled: x0 is the tracer's */
+                return;
+            }
+            c->owed = cng_pt_entry_owed();
+        }
+        c->f.owed = c->owed;
+        tramp_syscall(c, nr);
+        /* Active now, if not before: an attach can land in the call, and a
+         * tracer that resumed into syscall tracing then saw its restart's
+         * entry stop (pt_inflight_stop). A guest handler that ran over a call
+         * that blocked has had stops of its own, which settle the flag for
+         * theirs. */
+        if (!c->f.abandon && cng_pt_active()) {
+            cng_pt_entry_set(c->f.owed);
+            cng_pt_syscall_exit(r);
+            cng_pt_step_report(r);
+        }
+        if (!c->f.abandon)
+            return;
+        /* Abandoned at the restart's own entry stop: made again as the tracer
+         * left it, that stop already given — or, cancelled there, answered. */
+        if (c->f.entered) {
+            c->owed = c->f.owed;
+            if (c->f.nr == -1) {
+                cng_pt_entry_set(c->owed);
+                cng_pt_syscall_exit(r);
+                return;
+            }
+            nr = c->f.nr;
+            entered = 1;
+        } else {
+            /* Abandoned at the stop, and left at the svc: the call is made
+             * again, with the registers the tracer left — here rather than by
+             * resuming at the site, which under -R would spend x16/x17 on the
+             * trampoline's general exit. Left anywhere else, the thread goes
+             * there. */
+            if (r->pc != after - 4)
+                return;
+            r->pc = after;
+            nr = (long)r->x[8];
+            c->owed = 0;
+            entered = 0;
+        }
+        c->f.abandon = c->f.done = c->f.entered = 0;
     }
-    if (!cng_pt_syscall_entry(r, &nr)) {
-        cng_pt_syscall_exit(r); /* cancelled: x0 is the tracer's own answer */
-        return;
-    }
-    tramp_syscall(r, nr);
-    cng_pt_syscall_exit(r);
-    cng_pt_step_report(r);
 }
 
 void cng_tramp_dispatch(struct cng_uregs *r) {
+    struct tramp_call c = {.f = {.r = r}, .nr = (long)r->x[8],
+                           .mode = CNG_DISP_TRAMP};
     /* On the guest's own stack this is the same overflow the SIGSYS tier has a
      * 256 KiB scratch stack to avoid, and here it is not even a fault: the
      * dispatcher's frame is larger than a guard page, so it steps over the
      * guard and writes into ordinary guest memory below, silently. */
-    if (!cng_run_scratch(tramp_body, r))
-        tramp_body(r);
+    if (!cng_run_scratch_in(tramp_body, &c, &c.f))
+        tramp_body(&c);
+}
+
+void cng_dispatch_bounced(struct cng_uregs *r, long nr, int owed) {
+    struct tramp_call c = {.f = {.r = r}, .nr = nr, .mode = CNG_DISP_BOUNCED,
+                           .owed = owed};
+    /* Guest context, guest mask: the blocking call the dispatch makes runs on
+     * the guest's own stack, below the record (see reissue). */
+    c.f.gsp = ((unsigned long)r - 8) & ~15UL;
+    __atomic_add_fetch(&g_disp_bounced, 1, __ATOMIC_RELAXED);
+    if (!cng_run_scratch_in(tramp_body, &c, &c.f))
+        tramp_body(&c);
+    __atomic_sub_fetch(&g_disp_bounced, 1, __ATOMIC_RELAXED);
 }

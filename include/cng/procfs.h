@@ -62,6 +62,13 @@ extern int cng_g_procstat_synth;
  * even where the host files are readable (Android denies them to apps). */
 extern int cng_g_overflowid_synth;
 
+/* CNG_MM_MAP_DENY=1: take PR_SET_MM_MAP as refused, which Android's kernels do
+ * and a desktop one does not, so the kernel's own record of argv and environ
+ * stays the chroot-ng invocation and cmdline/environ are read out of guest
+ * memory by procfs.c instead. This is how that path gets exercised off a
+ * device. Settled before the first stack is published, read-only after. */
+extern int cng_g_mm_map_deny;
+
 /* Bring up the registry and choose the reserved fd range. Called once from
  * cng_run, before the seccomp filter is built. */
 void cng_procfs_init(void);
@@ -71,7 +78,10 @@ void cng_procfs_init(void);
  * execve would have laid down) plus the current exe and cwd. Called after every
  * stack build — the initial run and each emulated execve — because those are
  * the points a real kernel rewrites cmdline, environ and auxv. Also sets the
- * process name (comm), which the kernel would take from the exec'd file. */
+ * process name (comm), which the kernel would take from the exec'd file, and
+ * where the kernel allows it points its record of argv and environ at the
+ * guest's strings (PR_SET_MM_MAP), so its own cmdline and environ are the
+ * guest's. */
 void cng_procfs_publish_stack(unsigned long guest_sp);
 
 /* If `canon` (a canonical guest path) names a synthesized file, open the guest
@@ -106,6 +116,16 @@ int cng_procfs_fstatfs(int fd, void *buf);
 int cng_procfs_fix_path_statfs(long dirfd, const char *path, void *buf);
 int cng_procfs_link_name(const char *tgt, char *out, size_t sz);
 
+/* The owner of a process's /proc entries, under --fake-id. The kernel makes
+ * /proc/<pid> and what is under it the process's effective ids, which for a
+ * guest are the host's; for a stat the kernel has just filled for the name at
+ * (dirfd, path) — or for fd `dirfd` itself when `path` is empty — that landed
+ * on procfs inside a guest process's directory and was given the host's ids,
+ * those are replaced with the ids that process publishes (procreg.h), and 1 is
+ * returned. 0 leaves the buffer for the remap every other file gets. */
+int cng_procfs_owner(long dirfd, const char *path, void *stat);
+int cng_procfs_owner_statx(long dirfd, const char *path, void *statx);
+
 /* A stat the host refused. Android's SELinux policy denies an app the getattr
  * and the read access check of the global files it hides — /proc/version,
  * loadavg, uptime, stat — so `stat`, `test -r` and an fstat on an O_PATH fd of
@@ -135,5 +155,10 @@ int cng_procfs_synth_access(const char *canon, int mode, int follow);
  * behave as if the host had refused it, which Android does and a test host does
  * not. This is how the fallback above gets exercised off a device. */
 extern int cng_g_proc_deny_stat;
+
+/* CNG_PROCFS_REOPEN_DENY=1: take the read-only reopen of a synthesized view's
+ * memfd as refused, which Android's policy does and a test host does not, so
+ * the view is served from a file of ours instead (procfs.c, store_on). */
+extern int cng_g_procfs_reopen_deny;
 
 #endif /* CNG_PROCFS_H */

@@ -32,6 +32,33 @@ check_contains "SIGSYS tier: the tracer reads the trapped register file" \
     "sigsys tier: regs at the entry stop -> OK" "$ptout"
 check_contains "SIGSYS tier: syscall-exit stop carries the result" \
     "sigsys tier: syscall-exit stop -> OK" "$ptout"
+# A PTRACE_ATTACH whose kick reaches a new process on the way out of its fork,
+# before the converted clone's child-side hooks have run. Those hooks wiped the
+# attach the kick had just recorded, so the tracee never stopped again: the
+# rare "usr1 odd: killed 9" of the waitnowait scenario below, made certain.
+check_contains "an attach kick ahead of the fork's child hooks: attach stop" \
+    "fork kick: attach stop -> OK" "$ptout"
+check_contains "...and the tracee's next signal still stops" \
+    "fork kick: the next signal stops -> OK" "$ptout"
+check_contains "...and its exit reaches the tracer" \
+    "fork kick: tracee exited clean -> OK" "$ptout"
+# The -R tier's waits: the kernel's own for a process that cannot be owed an
+# emulated stop, where every one used to poll the registry in 50 ms slices.
+# What has to hold is the hand-over — a kick taken between the wait's look at
+# the registry and its svc, or one cutting the svc short, ends the wait so it
+# looks again; a child's PTRACE_TRACEME does that to a parent asleep in it.
+check_contains "-R native wait: a kick on the wait's frame ends it" \
+    "native wait: a kick's frame -> OK" "$ptout"
+check_contains "-R native wait: a kick before its svc is not slept through" \
+    "native wait: a kick before the svc -> OK" "$ptout"
+check_contains "-R native wait: a child's TRACEME hands it to the registry" \
+    "native wait: a child's TRACEME ends it -> OK" "$ptout"
+check_contains "...which then reports the child's stop" \
+    "native wait: the registry has its stop -> OK" "$ptout"
+check_contains "...and its exit" \
+    "native wait: tracee exited clean -> OK" "$ptout"
+check_contains "-R native wait: a tracer's fork waits natively again" \
+    "native wait: a tracer's fork is none -> OK" "$ptout"
 # The pointer-auth mask gdb asks for whenever AT_HWCAP says PACA, and is fatal
 # about ("unable to fetch pauth registers"). Measured rather than asked for, so
 # what is asserted is the shape the kernel's own answer always has.
@@ -78,19 +105,39 @@ pt_oracle_build() {
     return 1
 }
 
-# One scenario, both ways. Extra arguments are passed to both runs, with the
-# binary's own path substituted per side (the exec scenarios re-exec themselves).
+# One scenario, both ways. Each side is given its own binary's path after the
+# scenario name (the exec scenarios re-exec themselves).
+#
+# The guest side runs under -R unless PT_TIER says otherwise; the SIGSYS tier
+# needs a view with something in it (an identity view installs no monitor),
+# which an identity bind of the scratch directory is.
+PT_TIER=-R
+PT_TIER_NAME=
+
+# pt_case SCENARIO [LACKING WHY] — LACKING is the line the kernel side prints
+# when this host's kernel predates what the scenario asks for. There is no
+# reference to compare with then: the emulation answers as the kernel uname
+# advertises, not as the one underneath, so the leg is skipped, saying WHY.
 pt_case() {
     _sc=$1
     _oracle_out=$(cd "$PT_DIR" && timeout 60 "./$(basename "$PT_ORACLE")" \
         "$_sc" "./$(basename "$PT_ORACLE")" 2>/dev/null)
-    _guest_out=$(run_t 90 -R / "$PT_GUEST" "$_sc" "$PT_GUEST" 2>/dev/null)
+    if [ -n "${2:-}" ]; then
+        case "$_oracle_out" in
+        *"$2"*)
+            skip "ptrace $_sc: $3"
+            return ;;
+        esac
+    fi
+    # shellcheck disable=SC2086  # $PT_TIER is a deliberately split arg list
+    _guest_out=$(run_t 90 $PT_TIER / "$PT_GUEST" "$_sc" "$PT_GUEST" 2>/dev/null)
     if [ "$_oracle_out" = "$_guest_out" ]; then
         pass=$((pass + 1))
-        printf '  ok   ptrace %s matches the kernel\n' "$_sc"
+        printf '  ok   ptrace %s matches the kernel%s\n' "$_sc" "$PT_TIER_NAME"
     else
         fail=$((fail + 1))
-        printf '  FAIL ptrace %s diverges from the kernel\n' "$_sc"
+        printf '  FAIL ptrace %s diverges from the kernel%s\n' "$_sc" \
+            "$PT_TIER_NAME"
         printf '       kernel: %s\n' "$(echo "$_oracle_out" | tr '\n' '|')"
         printf '       guest : %s\n' "$(echo "$_guest_out" | tr '\n' '|')"
     fi
@@ -111,8 +158,9 @@ else
     # what the stacked trap-everything filter exists for.
     pt_case sysstop
     # PTRACE_GET_SYSCALL_INFO, which modern strace prefers over pairing the
-    # stops itself.
-    pt_case sysinfo
+    # stops itself. A kernel before 5.3 answers it EIO (Android 4.19 devices).
+    pt_case sysinfo "syscall_info unsupported" \
+        "the host kernel predates PTRACE_GET_SYSCALL_INFO (5.3), so it is no reference"
     # A tracer cancelling a syscall at its entry stop and substituting the
     # return value — proot's whole method.
     pt_case cancel
@@ -144,6 +192,47 @@ else
     pt_case step2
     # PTRACE_ATTACH to a process that is already running, and DETACH.
     pt_case attach
+    # The FP/SIMD register file at an attach stop and at a syscall stop, read
+    # and written, and the length rules GETREGSET applies to every regset.
+    # crashpad reads it from every thread of a crashed process, and every
+    # attach stop answered EINVAL: the stop had not kept the signal frame the
+    # registers were in, and a trampoline stop had none to keep. The frame's
+    # FPSIMD record was also read as if it were the ptrace layout, so even a
+    # stop that had one returned the registers shifted and lost a write.
+    pt_case fpregs
+    # PTRACE_ATTACH to a thread blocked in a syscall, which is where a crash
+    # reporter finds most threads: the stop shows the call the kernel's way —
+    # the thread's own registers, its arguments in place, pc at the syscall
+    # instruction — and the call is made again when the stop ends, with what
+    # the tracer left in the registers. A call the emulation was making for the
+    # thread showed chroot-ng's own pc and sp, one made in the SIGSYS handler
+    # could not be stopped until it returned (the attach hung), and the kick
+    # that stops a thread ended its call with EINTR.
+    pt_case blocked
+    # ...and the same with every signal blocked in the thread, as GLib's are.
+    # The kernel's attach is a SIGSTOP, which no mask holds back; ours is a
+    # kick, an ordinary signal, and the attach hung on such a thread for good —
+    # a crashed Chrome never exited, its crashpad waiting on gmain. The request
+    # is now sent as a SIGSYS too, which the guest can never block.
+    pt_case blockedmask
+    # ...and to such a thread that never sleeps, making trapped calls (a mkdir
+    # and an rmdir) as fast as it can, a hundred attaches: every one must stop
+    # it, and none may lose it a call or make one twice. A SIGSYS of ours
+    # pending when the thread traps absorbs the trap's, and the kernel skips
+    # the call; the handler makes it again, unless the frame is the one a
+    # handler of ours has just answered it with.
+    pt_case blockspin
+    # A thread and a fork child that a tracee makes after the attach, which
+    # the tracer does not follow, run as any untraced task. Both inherit the
+    # tracee's trap-everything filter, and neither had a record of it: every
+    # call the dispatcher does not handle itself came back ENOSYS there. The
+    # trap's tag now says which filter caught it.
+    pt_case threadafter
+    pt_case forkafter
+    # ...and blockspin's attach to such a thread, spinning on a call that only
+    # the inherited filter traps: whether a trap the SIGSYS displaced is made
+    # again depends on knowing the filter is there.
+    pt_case spinafter
     # ...and to two hundred tasks of one process, one after another: the
     # tracee's per-task state used to sit in 128 slots that were never given
     # back, so the 129th attach was reported a success and never stopped.
@@ -159,8 +248,10 @@ else
     # multi-entry leg walks both lists past their first entry, with the two
     # sides' boundaries deliberately not lining up — the emulation reads each
     # entry out of a copy of its own, so this is what moves it from one to the
-    # next.
-    pt_case vmrw
+    # next. A kernel from before import_iovec refuses the count whole, EINVAL
+    # (Android 8's 3.18), and is no reference for an emulation answering as 6.1.
+    pt_case vmrw "vmrw wrapcnt EINVAL" \
+        "the host kernel refuses an iovec count it does not narrow first (pre-import_iovec), so it is no reference"
     # Signals the emulation does not take over must still reach the kernel while
     # the task is traced. It hooks every catchable signal to route delivery
     # through the stop machinery, but SIGKILL and SIGSTOP are not among them —
@@ -219,6 +310,31 @@ else
     # TRACEVFORKDONE; it was reported for every vfork.
     pt_case options
 
+    # ...and every scenario again on the SIGSYS tier, which is the one a device
+    # runs without -R: a trapped call is made from the handler there, a call
+    # that can block is bounced to guest context, and the frames a stop reads
+    # are the kernel's. The legs above run under -R, so without these that tier
+    # had only the synthesized traps of -t ptracetest. Without a live filter
+    # nothing traps and the legs would be native.
+    if [ "$CNG_SECCOMP_LIVE" = 1 ]; then
+        PT_TIER="-b $PT_DIR:$PT_DIR"
+        PT_TIER_NAME=" (SIGSYS tier)"
+        for _sc in basic sysstop cancel poke signal deliver fork exec \
+            execstart patharg exitstop break step step2 attach fpregs blocked \
+            blockedmask blockspin threadafter forkafter spinafter attachmany \
+            sigact sigchld sigchldw waitid waitnowait options; do
+            pt_case "$_sc"
+        done
+        pt_case sysinfo "syscall_info unsupported" \
+            "the host kernel predates PTRACE_GET_SYSCALL_INFO (5.3), so it is no reference"
+        pt_case vmrw "vmrw wrapcnt EINVAL" \
+            "the host kernel refuses an iovec count it does not narrow first (pre-import_iovec), so it is no reference"
+        PT_TIER=-R
+        PT_TIER_NAME=
+    else
+        skip "ptrace on the SIGSYS tier: the seccomp filter is inert here"
+    fi
+
     # ...and the same, with a rootfs actually in the way: the guest binary is
     # bound in so it can be loaded, and the trace must still read the guest's
     # own string rather than the translated host path.
@@ -260,8 +376,15 @@ fi
 # is inert the filter cannot go in at all, and an option that needs one is then
 # a refusal to enter the guest -- which is the same fact, told the only way an
 # inert host can tell it (it used to run the guest anyway, with the option
-# silently inert, behind a warning).
-if guest_cc_report "$PT_DIR/nnprivs" tests/guests/nnprivs.c; then
+# silently inert, behind a warning). A kernel before 4.10 has no NoNewPrivs line
+# in /proc/self/status to show the bit through (Android 8's 3.18), and the
+# guest's own prctl is answered by the monitor, so there is no reading the bit
+# there at all.
+if ! guest_cc_report "$PT_DIR/nnprivs" tests/guests/nnprivs.c; then
+    :
+elif [ "$(emu_t 30 "$PT_DIR/nnprivs" 2>/dev/null)" = absent ]; then
+    skip "which options install a monitor: /proc/self/status has no NoNewPrivs line on this kernel (4.10+)"
+else
     out=$(run_t 60 / "$PT_DIR/nnprivs" 2>/dev/null)
     check_contains "an identity view with nothing to translate installs no monitor" \
         "nnp=0" "$out"
